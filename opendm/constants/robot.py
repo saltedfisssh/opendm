@@ -18,6 +18,7 @@ class RobotType(Enum):
     UR5 = "UR5"
     ALOHA = "ALOHA"
     FRANKA = "Franka"
+    PIPER = "Piper"
     ALOHA_ROBOTWIN2 = "Aloha RoboTwin2"
 
 
@@ -33,4 +34,5 @@ ROBOT_STATE_DESCS = {
     + [RobotStateDesc.GRIPPER]
     + [RobotStateDesc.JOINT] * 6
     + [RobotStateDesc.GRIPPER],
+    RobotType.PIPER: [RobotStateDesc.JOINT] * 6 + [RobotStateDesc.GRIPPER],
 }
