@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from contextlib import ExitStack
@@ -45,39 +46,116 @@ IMAGE_KEYS = {
 STATE_DIMS = {"arx5": 7, "ur5": 7, "aloha": 14, "dos_w1": 14}
 
 
+def parse_gripper_thresholds(values: list[str] | None) -> dict[str, tuple[float, ...]]:
+    """Parse repeatable ``EMBODIMENT=t[,t]`` gripper threshold arguments."""
+    result: dict[str, tuple[float, ...]] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise ValueError(
+                f"invalid gripper threshold {value!r}; expected EMBODIMENT=t[,t]"
+            )
+        embodiment, raw_thresholds = value.split("=", 1)
+        embodiment = embodiment.strip().lower()
+        if embodiment not in EMBODIMENTS:
+            raise ValueError(f"unknown embodiment {embodiment!r} in gripper threshold")
+        if embodiment in result:
+            raise ValueError(f"duplicate gripper threshold for {embodiment}")
+        try:
+            thresholds = tuple(
+                float(item.strip()) for item in raw_thresholds.split(",")
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"invalid numeric gripper threshold for {embodiment}: "
+                f"{raw_thresholds!r}"
+            ) from error
+        expected = len(STATE_FILES[embodiment])
+        if len(thresholds) != expected:
+            raise ValueError(
+                f"{embodiment} requires {expected} gripper threshold(s), "
+                f"got {len(thresholds)}"
+            )
+        if not all(math.isfinite(threshold) for threshold in thresholds):
+            raise ValueError(f"gripper thresholds for {embodiment} must be finite")
+        result[embodiment] = thresholds
+    return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--raw-dir", type=Path, default=Path("data/Table30v2"),
+        "--raw-dir",
+        type=Path,
+        default=Path("data/Table30v2"),
         help="Table30v2 root (default: data/Table30v2)",
     )
     parser.add_argument(
-        "--output-dir", type=Path, default=Path("data/table30v2_dexdata"),
+        "--output-dir",
+        type=Path,
+        default=Path("data/table30v2_dexdata"),
         help="Output annotation root (default: data/table30v2_dexdata)",
     )
     parser.add_argument(
-        "--embodiments", nargs="+", choices=EMBODIMENTS, default=list(EMBODIMENTS),
+        "--embodiments",
+        nargs="+",
+        choices=EMBODIMENTS,
+        default=list(EMBODIMENTS),
         help="Embodiments to convert",
     )
     parser.add_argument(
-        "--tasks", nargs="+", default=None,
+        "--tasks",
+        nargs="+",
+        default=None,
         help="Optional task-name allowlist (default: all tasks)",
     )
     parser.add_argument(
-        "--frame-interval", type=int, default=1,
+        "--frame-interval",
+        type=int,
+        default=1,
         help="Keep every Nth source frame (default: 1)",
     )
     parser.add_argument(
-        "--max-episodes-per-task", type=int, default=None,
+        "--max-episodes-per-task",
+        type=int,
+        default=None,
         help="Limit episodes per task, useful for a smoke test",
     )
-    parser.add_argument("--overwrite", action="store_true", help="Replace existing episode JSONL files")
-    parser.add_argument("--dry-run", action="store_true", help="Inspect and count episodes without writing")
+    parser.add_argument(
+        "--gripper-threshold",
+        action="append",
+        default=[],
+        metavar="EMBODIMENT=t[,t]",
+        help=(
+            "Binarize gripper widths as 0=closed and 1=open using an "
+            "embodiment-specific threshold. Repeat for multiple embodiments; "
+            "dual-arm robots require left,right thresholds. Example: "
+            "--gripper-threshold arx5=0.03 --gripper-threshold "
+            "aloha=0.0406,0.0345"
+        ),
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Replace existing episode JSONL files"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Inspect and count episodes without writing",
+    )
     args = parser.parse_args()
     if args.frame_interval < 1:
         parser.error("--frame-interval must be >= 1")
     if args.max_episodes_per_task is not None and args.max_episodes_per_task < 1:
         parser.error("--max-episodes-per-task must be >= 1")
+    try:
+        args.gripper_thresholds = parse_gripper_thresholds(args.gripper_threshold)
+    except ValueError as error:
+        parser.error(str(error))
+    unused_thresholds = set(args.gripper_thresholds) - set(args.embodiments)
+    if unused_thresholds:
+        parser.error(
+            "gripper threshold configured for unselected embodiment(s): "
+            + ", ".join(sorted(unused_thresholds))
+        )
     return args
 
 
@@ -88,7 +166,9 @@ def read_json(path: Path) -> dict:
 
 def embodiment_from_episode(task_info: dict, episode_meta: dict) -> str:
     robot_id = str(episode_meta.get("robot_id", "")).lower()
-    tags = " ".join(map(str, task_info.get("task_desc", {}).get("task_tag", []))).lower()
+    tags = " ".join(
+        map(str, task_info.get("task_desc", {}).get("task_tag", []))
+    ).lower()
     identity = f"{robot_id} {tags}"
     if "arx5" in identity:
         return "arx5"
@@ -98,7 +178,9 @@ def embodiment_from_episode(task_info: dict, episode_meta: dict) -> str:
         return "aloha"
     if "w1" in identity or "dos-w1" in identity or "dos_w1" in identity:
         return "dos_w1"
-    raise ValueError(f"cannot identify embodiment from robot_id={robot_id!r}, tags={tags!r}")
+    raise ValueError(
+        f"cannot identify embodiment from robot_id={robot_id!r}, tags={tags!r}"
+    )
 
 
 def state_lines(paths: list[Path]) -> Iterator[tuple[int, list[dict]]]:
@@ -118,9 +200,18 @@ def state_lines(paths: list[Path]) -> Iterator[tuple[int, list[dict]]]:
             frame_idx += 1
 
 
-def make_state(rows: list[dict], paths: list[Path]) -> list[float]:
+def make_state(
+    rows: list[dict],
+    paths: list[Path],
+    gripper_thresholds: tuple[float, ...] | None = None,
+) -> list[float]:
+    if gripper_thresholds is not None and len(gripper_thresholds) != len(rows):
+        raise ValueError(
+            f"expected {len(rows)} gripper threshold(s), "
+            f"got {len(gripper_thresholds)}"
+        )
     state: list[float] = []
-    for row, path in zip(rows, paths):
+    for arm_index, (row, path) in enumerate(zip(rows, paths, strict=True)):
         joints = row.get("joint_positions")
         if not isinstance(joints, list) or len(joints) != 6:
             raise ValueError(f"expected 6 joint_positions in {path}")
@@ -132,7 +223,11 @@ def make_state(rows: list[dict], paths: list[Path]) -> list[float]:
         if not isinstance(gripper, (int, float)):
             raise ValueError(f"invalid gripper_width in {path}")
         state.extend(float(value) for value in joints)
-        state.append(float(gripper))
+        if gripper_thresholds is None:
+            state.append(float(gripper))
+        else:
+            # Width grows as the gripper opens on all Table30v2 embodiments.
+            state.append(float(gripper >= gripper_thresholds[arm_index]))
     return state
 
 
@@ -162,9 +257,11 @@ def rebuild_outputs(
     output_dir: Path,
     raw_dir: Path,
     converted_indexes: dict[str, dict[str, dict[str, int]]],
+    gripper_thresholds: dict[str, tuple[float, ...]] | None = None,
 ) -> dict:
     """Update per-task/embodiment indexes and write the registration manifest."""
     datasets = {}
+    gripper_thresholds = gripper_thresholds or {}
     for embodiment in EMBODIMENTS:
         embodiment_dir = output_dir / embodiment
         if not embodiment_dir.is_dir():
@@ -172,14 +269,20 @@ def rebuild_outputs(
 
         aggregate: dict[str, int] = {}
         task_names = []
-        for task_dir in sorted(path for path in embodiment_dir.iterdir() if path.is_dir()):
+        for task_dir in sorted(
+            path for path in embodiment_dir.iterdir() if path.is_dir()
+        ):
             index_path = task_dir / "index_cache.json"
             updates = converted_indexes.get(embodiment, {}).get(task_dir.name)
             if updates is not None:
                 current = load_index(index_path)
                 current.update(updates)
                 # Drop entries whose annotation was removed outside this script.
-                current = {path: count for path, count in current.items() if Path(path).is_file()}
+                current = {
+                    path: count
+                    for path, count in current.items()
+                    if Path(path).is_file()
+                }
                 write_index(index_path, current)
             task_files = load_index(index_path)
             if not task_files:
@@ -196,6 +299,12 @@ def rebuild_outputs(
                 "image_keys": IMAGE_KEYS[embodiment],
                 "state_dim": STATE_DIMS[embodiment],
             }
+            if embodiment in gripper_thresholds:
+                datasets[dataset_name]["gripper_binarization"] = {
+                    "thresholds": list(gripper_thresholds[embodiment]),
+                    "closed_value": 0.0,
+                    "open_value": 1.0,
+                }
 
         if not aggregate:
             continue
@@ -210,12 +319,26 @@ def rebuild_outputs(
             "image_keys": IMAGE_KEYS[embodiment],
             "state_dim": STATE_DIMS[embodiment],
         }
+        if embodiment in gripper_thresholds:
+            datasets[dataset_name]["gripper_binarization"] = {
+                "thresholds": list(gripper_thresholds[embodiment]),
+                "closed_value": 0.0,
+                "open_value": 1.0,
+            }
 
     manifest = {
         "format_version": 1,
         "raw_dir": str(raw_dir),
         "output_dir": str(output_dir),
         "datasets": datasets,
+        "gripper_binarization": {
+            embodiment: {
+                "thresholds": list(thresholds),
+                "closed_value": 0.0,
+                "open_value": 1.0,
+            }
+            for embodiment, thresholds in gripper_thresholds.items()
+        },
     }
     manifest_path = output_dir / "manifest.json"
     temporary = manifest_path.with_suffix(".json.tmp")
@@ -234,6 +357,7 @@ def convert_episode(
     output_file: Path,
     frame_interval: int,
     overwrite: bool,
+    gripper_thresholds: tuple[float, ...] | None = None,
 ) -> int:
     if output_file.exists() and not overwrite:
         raise FileExistsError(f"output exists (use --overwrite): {output_file}")
@@ -242,7 +366,9 @@ def convert_episode(
     states = [episode_dir / "states" / name for name in STATE_FILES[embodiment]]
     missing = [path for path in videos + states if not path.is_file()]
     if missing:
-        raise FileNotFoundError(f"missing episode files: {', '.join(map(str, missing))}")
+        raise FileNotFoundError(
+            f"missing episode files: {', '.join(map(str, missing))}"
+        )
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_file.with_suffix(output_file.suffix + ".tmp")
@@ -261,11 +387,13 @@ def convert_episode(
                     for index, video in enumerate(videos)
                 }
                 sample.update(
-                    state=make_state(rows, states),
+                    state=make_state(rows, states, gripper_thresholds),
                     prompt=prompt,
                     is_robot=True,
                 )
-                output.write(json.dumps(sample, ensure_ascii=False, separators=(",", ":")) + "\n")
+                output.write(
+                    json.dumps(sample, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
                 samples += 1
         if samples < 2:
             raise ValueError(f"episode has fewer than 2 selected frames: {episode_dir}")
@@ -300,7 +428,9 @@ def main() -> int:
         prompt = task_info.get("task_desc", {}).get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError(f"missing prompt in {task_dir / 'meta/task_info.json'}")
-        episodes = sorted(path for path in (task_dir / "data").iterdir() if path.is_dir())
+        episodes = sorted(
+            path for path in (task_dir / "data").iterdir() if path.is_dir()
+        )
         if args.max_episodes_per_task is not None:
             episodes = episodes[: args.max_episodes_per_task]
         episode_iter = tqdm(
@@ -324,8 +454,15 @@ def main() -> int:
                 / episode_output_name(task_dir.name, episode_dir.name)
             )
             samples = convert_episode(
-                episode_dir, task_dir.name, prompt, embodiment, raw_dir, output_file,
-                args.frame_interval, args.overwrite,
+                episode_dir,
+                task_dir.name,
+                prompt,
+                embodiment,
+                raw_dir,
+                output_file,
+                args.frame_interval,
+                args.overwrite,
+                args.gripper_thresholds.get(embodiment),
             )
             counts[embodiment]["samples"] += samples
             task_index = index_data[embodiment].setdefault(task_dir.name, {})
@@ -333,11 +470,23 @@ def main() -> int:
 
     if not args.dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
-        manifest = rebuild_outputs(output_dir, raw_dir, index_data)
+        manifest = rebuild_outputs(
+            output_dir, raw_dir, index_data, args.gripper_thresholds
+        )
 
     for embodiment in args.embodiments:
         values = counts[embodiment]
-        print(f"{embodiment}: {values['episodes']} episodes, {values['samples']} samples")
+        print(
+            f"{embodiment}: {values['episodes']} episodes, {values['samples']} samples"
+        )
+        if embodiment in args.gripper_thresholds:
+            thresholds = ", ".join(
+                str(value) for value in args.gripper_thresholds[embodiment]
+            )
+            print(
+                f"  gripper binarization: threshold(s) [{thresholds}], "
+                "closed=0, open=1"
+            )
     if args.dry_run:
         print("Dry run only; no files were written.")
     else:
@@ -352,6 +501,11 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (FileNotFoundError, FileExistsError, ValueError, json.JSONDecodeError) as error:
+    except (
+        FileNotFoundError,
+        FileExistsError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
         print(f"error: {error}", file=sys.stderr)
         raise SystemExit(2)

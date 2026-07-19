@@ -12,7 +12,7 @@ from opendm.constants.robot import RobotStateDesc
 from opendm.dataset.register import register_dataset
 
 
-DEFAULT_MANIFEST = Path("./data/table30v2_dexdata/manifest.json")
+DEFAULT_MANIFEST = Path("./data/table30v2_dexdata_binary/manifest.json")
 MANIFEST_PATH = Path(os.getenv("OPENDM_TABLE30V2_MANIFEST", DEFAULT_MANIFEST))
 
 
