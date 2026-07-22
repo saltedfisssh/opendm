@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASE_URL="http://127.0.0.1:9999/process_frame"
 EMBODIMENT="arx5"
-MANIFEST="${TABLE30V2_MANIFEST:-${ROOT_DIR}/data/table30v2_dexdata/manifest.json}"
+MANIFEST="${TABLE30V2_MANIFEST:-${ROOT_DIR}/data/table30v2_dexdata_binary/manifest.json}"
 SAMPLE_LINE=1
 DRY_RUN=0
 
