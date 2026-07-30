@@ -23,6 +23,7 @@ from opendm.constants.robot import ROBOT_STATE_DESCS, ActionMode, RobotType
 from opendm.data.augmentations import NoAugmentationPipeline, TrainingTransformPipeline
 from opendm.data.collator import NormStatsCollator, TrainingCollator
 from opendm.data.dataset import JsonlDataset
+from opendm.data.sampler import TaskBalancedSampler
 from opendm.data.transforms import (
     ActionAbsolute,
     BuildAction,
@@ -209,6 +210,7 @@ class DM05TrainerConfig(Config):
     dataloader_num_workers: int = field(default=4)
     dataloader_persistent_workers: bool = field(default=True)
     dataloader_prefetch_factor: int = field(default=2)
+    balance_tasks: bool = field(default=True)
     model_max_length: int = field(default=1024)
     bf16: bool = field(default=True)
     tf32: bool = field(default=True)
@@ -317,6 +319,7 @@ class DM05DataConfig(Config):
         action_horizon: int,
         batch_size: int = 128,
         num_workers: int = 32,
+        balance_tasks: bool = False,
     ) -> None:
         norm_keys = ["state", "action"]
         dataset_info = self._dataset_info()
@@ -326,14 +329,21 @@ class DM05DataConfig(Config):
             dataset_name=self.dataset_name,
             dataset_meta=self._dataset_meta(dataset_info),
         )
+        sampler = None
+        if balance_tasks and len(dataset.task_to_indices) > 1:
+            sampler = TaskBalancedSampler(
+                task_to_indices=dataset.task_to_indices,
+                num_samples=len(dataset),
+            )
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=sampler is None,
+            sampler=sampler,
             num_workers=num_workers,
             collate_fn=NormStatsCollator(),
-            persistent_workers=True,
-            prefetch_factor=4,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
         )
         stats = {key: normalize.RunningStats() for key in norm_keys}
         max_batches = self.compute_norm_stats_max_batches or len(dataloader)
@@ -536,7 +546,8 @@ class DM05Exp(Config):
 
         if self.local_rank == 0:
             self.data_config.compute_norm_stats(
-                action_horizon=self.model_config.chunk_size
+                action_horizon=self.model_config.chunk_size,
+                balance_tasks=self.trainer_config.balance_tasks,
             )
         else:
             while not norm_stats_path.exists():

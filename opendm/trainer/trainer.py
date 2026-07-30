@@ -7,6 +7,8 @@ import transformers
 from loguru import logger
 from transformers import Trainer, TrainingArguments
 
+from opendm.data.sampler import TaskBalancedSampler
+
 
 class DMTrainer(Trainer):
     """Trainer extension for OpenDM model training."""
@@ -16,6 +18,25 @@ class DMTrainer(Trainer):
         training_args = self._link_exp_config()
         super().__init__(*args, args=training_args, **kwargs)
         self.loss_cache = {}
+
+    def _get_train_sampler(self, train_dataset=None):
+        dataset = train_dataset if train_dataset is not None else self.train_dataset
+        task_to_indices = getattr(dataset, "task_to_indices", {})
+        balance_tasks = getattr(
+            self.exp_config.trainer_config, "balance_tasks", True
+        )
+        if balance_tasks and len(task_to_indices) > 1:
+            logger.info(
+                "Using task-balanced sampling for {} tasks: {}",
+                len(task_to_indices),
+                ", ".join(sorted(task_to_indices)),
+            )
+            return TaskBalancedSampler(
+                task_to_indices=task_to_indices,
+                num_samples=len(dataset),
+                seed=getattr(self.exp_config.trainer_config, "seed", 42),
+            )
+        return super()._get_train_sampler(train_dataset)
 
     def _prepare_for_training(self, *args, **kwargs):
         if not getattr(self.exp_config, "use_lora", False):

@@ -1,5 +1,6 @@
 import json
 import os
+from collections import defaultdict
 
 import megfile
 import orjson
@@ -37,6 +38,50 @@ class JsonlDataset(Dataset):
         self.sample_index = sample_index
         self.id_to_jsonl = {v: k for k, v in file_to_id.items()}
         self.total_samples = len(self.sample_index)
+        self.task_to_indices = self._build_task_index(file_to_nsamples, file_to_id)
+
+    def _build_task_index(
+        self, file_to_nsamples: dict[str, int], file_to_id: dict[str, int]
+    ) -> dict[str, list[int]]:
+        """Index samples by task directory for task-balanced training.
+
+        Converted multi-task datasets store episodes as
+        ``<jsonl_dir>/<task>/<episode>.jsonl``.  Keeping this index on the
+        dataset lets the trainer balance tasks without parsing transformed
+        samples or loading images.
+        """
+        declared_tasks = (self.dataset_meta or {}).get("tasks", [])
+        if len(declared_tasks) <= 1:
+            return {}
+
+        file_id_to_task = {}
+        for jsonl_file in file_to_nsamples:
+            relative_path = os.path.relpath(jsonl_file, self.jsonl_dir)
+            parts = relative_path.replace("\\", "/").split("/")
+            if len(parts) < 2 or parts[0] in ("", ".", ".."):
+                raise ValueError(
+                    f"Multi-task dataset {self.dataset_name!r} must store JSONL "
+                    f"files under one task directory per task: {jsonl_file}"
+                )
+            file_id_to_task[file_to_id[jsonl_file]] = parts[0]
+
+        task_to_indices = defaultdict(list)
+        for sample_idx, (file_id, _) in enumerate(self.sample_index):
+            task_to_indices[file_id_to_task[file_id]].append(sample_idx)
+
+        empty_tasks = [task for task, indices in task_to_indices.items() if not indices]
+        if empty_tasks:
+            raise ValueError(
+                f"Multi-task dataset {self.dataset_name!r} has empty tasks: {empty_tasks}"
+            )
+        if len(task_to_indices) != len(declared_tasks):
+            raise ValueError(
+                f"Multi-task dataset {self.dataset_name!r} declares "
+                f"{len(declared_tasks)} tasks but its JSONL directory contains "
+                f"{len(task_to_indices)} task directories: "
+                f"{sorted(task_to_indices)}"
+            )
+        return dict(task_to_indices)
 
     def _get_index_cache(self, jsonl_dir: str) -> dict:
         index_cache_file = os.path.join(jsonl_dir, "index_cache.json")

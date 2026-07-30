@@ -240,6 +240,7 @@ script/dm05_launcher.sh \
 - 启动推理服务：参考[推理](#推理)
 - 使用 demo 或自有数据进行 DM05 SFT：参考[DM05 SFT 与验证指南](docs/zh/dm05_finetuning.md)
 - Benchmark 训练和评测：参考[DM05 LIBERO 训练与评测指南](docs/zh/dm05_libero.md)和[DM05 RoboTwin2.0 训练与评测指南](docs/zh/dm05_robotwin2.md)；LIBERO LoRA SFT 参考[DM05 LIBERO LoRA 训练](docs/zh/dm05_libero_lora_training.md)
+- RoboChallenge Table30 v2 多任务等权训练：参考[DM05 RoboChallenge 多任务 SFT 配置](docs/zh/dm05_robochallenge_sft.md)
 
 ## 社区与支持
 
