@@ -243,6 +243,7 @@ Use the benchmark fine-tuning guides as end-to-end references for fine-tuning DM
 - Start inference service: see [Inference](#inference).
 - DM05 SFT with demo or custom data: see [DM05 SFT and Validation Guide](docs/en/dm05_finetuning.md).
 - Benchmark training and evaluation: see the [DM05 LIBERO Training and Evaluation Guide](docs/en/dm05_libero.md) and [DM05 RoboTwin2.0 Training and Evaluation Guide](docs/en/dm05_robotwin2.md); for LIBERO LoRA SFT, see [DM05 LIBERO LoRA Training](docs/en/dm05_libero_lora_training.md).
+- Train with velocity-weighted flow matching: see [DM05 AttenA+ Velocity Attention](docs/en/attena_plus.md).
 
 ## Community and Support
 

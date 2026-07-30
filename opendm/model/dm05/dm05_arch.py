@@ -28,6 +28,7 @@ from transformers.models.gemma3.modeling_gemma3 import (
     repeat_kv,
 )
 
+from opendm.losses import VelocityAttention
 from opendm.model.base import (
     DMBaseConfig,
     DMPreTrainedModel,
@@ -62,6 +63,14 @@ class DM05Config(DMBaseConfig):
         action_config=None,
         action_dim: int = 32,
         chunk_size: int = 50,
+        use_velocity_attention: bool = False,
+        velocity_weight_strategy: str = "inverse_squared",
+        velocity_clip_max_weight: float = 2.0,
+        velocity_epsilon: float = 1e-3,
+        velocity_alpha: float = 5.0,
+        velocity_normalize_weights: bool = True,
+        velocity_joint_dims: int = 6,
+        velocity_joint_indices: list[int] | None = None,
         tie_word_embeddings: bool = True,
         **kwargs,
     ):
@@ -74,6 +83,14 @@ class DM05Config(DMBaseConfig):
         self.action_config = action_config
         self.action_dim = action_dim
         self.chunk_size = chunk_size
+        self.use_velocity_attention = use_velocity_attention
+        self.velocity_weight_strategy = velocity_weight_strategy
+        self.velocity_clip_max_weight = velocity_clip_max_weight
+        self.velocity_epsilon = velocity_epsilon
+        self.velocity_alpha = velocity_alpha
+        self.velocity_normalize_weights = velocity_normalize_weights
+        self.velocity_joint_dims = velocity_joint_dims
+        self.velocity_joint_indices = velocity_joint_indices
         self.tie_word_embeddings = tie_word_embeddings
 
 
@@ -821,12 +838,29 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
         v_t = self.model.action_out_proj(suffix_out).to(torch.float32)
         u_t = u_t.to(dtype=v_t.dtype)
 
-        elem_mse = F.mse_loss(v_t, u_t, reduction="none")  # [B, T, D]
-
-        per_sample_fm = (elem_mse * action_mask).sum(dim=(1, 2)) / action_mask.sum(
-            dim=(1, 2)
-        )
-        fm_loss = per_sample_fm.mean()
+        if self.config.use_velocity_attention:
+            velocity_attention = VelocityAttention(
+                weight_strategy=self.config.velocity_weight_strategy,
+                clip_max_weight=self.config.velocity_clip_max_weight,
+                epsilon=self.config.velocity_epsilon,
+                alpha=self.config.velocity_alpha,
+                normalize_weights=self.config.velocity_normalize_weights,
+                joint_dims=self.config.velocity_joint_dims,
+                joint_indices=self.config.velocity_joint_indices,
+            )
+            fm_loss = velocity_attention.weighted_loss(
+                ground_truth=action.to(dtype=v_t.dtype),
+                predicted=v_t,
+                target=u_t,
+                loss_type="mse",
+                action_mask=action_mask,
+            )
+        else:
+            elem_mse = F.mse_loss(v_t, u_t, reduction="none")  # [B, T, D]
+            per_sample_fm = (elem_mse * action_mask).sum(
+                dim=(1, 2)
+            ) / action_mask.sum(dim=(1, 2)).clamp_min(1)
+            fm_loss = per_sample_fm.mean()
 
         return DM05OutputWithPast(
             loss=fm_loss,

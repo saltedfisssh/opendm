@@ -19,7 +19,12 @@ from tqdm import tqdm
 from transformers import AutoProcessor
 
 import opendm.data.normalize as normalize
-from opendm.constants.robot import ROBOT_STATE_DESCS, ActionMode, RobotType
+from opendm.constants.robot import (
+    ROBOT_STATE_DESCS,
+    ActionMode,
+    RobotStateDesc,
+    RobotType,
+)
 from opendm.data.augmentations import NoAugmentationPipeline, TrainingTransformPipeline
 from opendm.data.collator import NormStatsCollator, TrainingCollator
 from opendm.data.dataset import JsonlDataset
@@ -72,11 +77,29 @@ class DM05ModelConfig(Config):
     freeze_vlm_embedding: bool = field(default=True)
     vlm_gradient_checkpointing: bool = field(default=True)
     ae_gradient_checkpointing: bool = field(default=True)
+    use_velocity_attention: bool = field(default=False)
+    velocity_weight_strategy: Literal[
+        "inverse", "inverse_squared", "exp_decay", "log"
+    ] = field(default="inverse_squared")
+    velocity_clip_max_weight: float = field(default=2.0)
+    velocity_epsilon: float = field(default=1e-3)
+    velocity_alpha: float = field(default=5.0)
+    velocity_normalize_weights: bool = field(default=True)
+    velocity_joint_dims: int = field(default=6)
+    velocity_joint_indices: list[int] | None = field(default=None)
     lora_config: DM05LoraConfig = field(default_factory=DM05LoraConfig)
 
     def _config_overrides(self) -> dict:
         return {
             "chunk_size": self.chunk_size,
+            "use_velocity_attention": self.use_velocity_attention,
+            "velocity_weight_strategy": self.velocity_weight_strategy,
+            "velocity_clip_max_weight": self.velocity_clip_max_weight,
+            "velocity_epsilon": self.velocity_epsilon,
+            "velocity_alpha": self.velocity_alpha,
+            "velocity_normalize_weights": self.velocity_normalize_weights,
+            "velocity_joint_dims": self.velocity_joint_dims,
+            "velocity_joint_indices": self.velocity_joint_indices,
         }
 
     def _torch_dtype(self) -> torch.dtype:
@@ -563,6 +586,7 @@ class DM05Exp(Config):
             logger.add(lambda msg: None)
 
         self._ensure_norm_stats()
+        self._resolve_velocity_joint_indices()
 
         model = self.model_config.build_model(use_lora=self.use_lora)
         self.model = model
@@ -593,6 +617,38 @@ class DM05Exp(Config):
         }
         trainer = DMTrainer(**trainer_kwargs)
         self.trainer = trainer
+
+    def _resolve_velocity_joint_indices(self) -> None:
+        """Resolve exact joint positions from dataset semantics when unspecified."""
+        config = self.model_config
+        if not config.use_velocity_attention or config.velocity_joint_indices is not None:
+            return
+
+        state_desc = self.data_config._dataset_info().get("state_desc")
+        if not state_desc:
+            logger.warning(
+                "Dataset has no state_desc; AttenA+ falls back to the first {} "
+                "action dimensions.",
+                config.velocity_joint_dims,
+            )
+            return
+
+        joint_indices = [
+            index
+            for index, desc in enumerate(state_desc)
+            if (desc.value if isinstance(desc, Enum) else desc)
+            == RobotStateDesc.JOINT.value
+        ]
+        if not joint_indices:
+            raise ValueError(
+                "AttenA+ could not find any joint dimensions in dataset state_desc"
+            )
+        config.velocity_joint_indices = joint_indices
+        logger.info(
+            "Resolved AttenA+ joint indices from dataset {}: {}",
+            self.data_config.dataset_name,
+            joint_indices,
+        )
 
     def train(self):
         self._initialize_train()
