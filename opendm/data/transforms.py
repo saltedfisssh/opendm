@@ -16,6 +16,7 @@ from opendm.constants.robot import (
     ActionMode,
     RobotStateDesc,
 )
+from opendm.data import se3
 from opendm.data.augmentations import TransformPipeline
 from opendm.data.normalize import NormStats, NormStatsFile, load_norm_stats_file
 
@@ -364,22 +365,30 @@ class ActionRelative:
 class BuildAction:
     """Build action targets in absolute or relative mode.
 
-    This transform composes ``BuildActionChunk`` with ``ActionRelative`` when
-    relative actions are requested, and only builds the chunk for absolute
+    This transform composes ``BuildActionChunk`` with a relative-action encoder
+    when relative actions are requested, and only builds the chunk for absolute
     actions.
 
     Args:
         action_horizon: Number of future timesteps to include.
         action_mode: Action representation to produce.
         non_delta_ids: State descriptor names or enum values that should remain
-            absolute when ``action_mode`` is ``ActionMode.RELATIVE``.
+            absolute when ``action_mode`` is ``ActionMode.RELATIVE``. Only used
+            by the ``"vector"`` relative mode; the ``"se3"`` mode always keeps
+            gripper commands absolute and always drops ``AUX`` dimensions.
+        relative_mode: How relative targets are formed. ``"vector"`` subtracts
+            the state elementwise, giving a base-frame delta. ``"se3"`` composes
+            ``T_current^-1 @ T_target`` per arm, giving the body-frame delta of
+            the UMI line of work. Ignored in absolute mode.
 
     Raises:
         AssertionError: If ``action_horizon`` is not positive or
             ``action_mode`` is not an ``ActionMode``.
-        ValueError: If relative mode is configured without ``non_delta_ids`` or
-            an unsupported action mode is provided.
+        ValueError: If relative mode is configured without ``non_delta_ids``, or
+            an unsupported action or relative mode is provided.
     """
+
+    RELATIVE_MODES = ("vector", "se3")
 
     def __init__(
         self,
@@ -388,6 +397,7 @@ class BuildAction:
         non_delta_ids: tuple[RobotStateDesc | str, ...] | list[RobotStateDesc | str] = (
             RobotStateDesc.GRIPPER,
         ),
+        relative_mode: str = "vector",
     ):
         assert action_horizon > 0, "action_horizon must be greater than 0"
         assert isinstance(
@@ -396,10 +406,16 @@ class BuildAction:
         ), "action_mode must be an instance of ActionMode"
         if action_mode == ActionMode.RELATIVE and not non_delta_ids:
             raise ValueError("non_delta_ids must be provided for relative action mode")
+        if relative_mode not in self.RELATIVE_MODES:
+            raise ValueError(
+                f"Unsupported relative_mode: {relative_mode!r}; "
+                f"expected one of {self.RELATIVE_MODES}"
+            )
 
         self.action_horizon = action_horizon
         self.action_mode = action_mode
         self.non_delta_ids = {_state_desc_value(desc) for desc in non_delta_ids}
+        self.relative_mode = relative_mode
 
         if action_mode == ActionMode.RELATIVE:
             self.build_pipeline = self._build_relative_action_pipeline()
@@ -412,12 +428,11 @@ class BuildAction:
         return f"BuildAction({self.build_pipeline})"
 
     def _build_relative_action_pipeline(self):
-        return Pipeline(
-            [
-                BuildActionChunk(self.action_horizon),
-                ActionRelative(non_delta_ids=list(self.non_delta_ids)),
-            ]
-        )
+        if self.relative_mode == "se3":
+            encoder = ActionRelativeSE3()
+        else:
+            encoder = ActionRelative(non_delta_ids=list(self.non_delta_ids))
+        return Pipeline([BuildActionChunk(self.action_horizon), encoder])
 
     def _build_absolute_action_pipeline(self):
         return Pipeline(
@@ -604,6 +619,155 @@ class ActionAbsolute:
                 )
 
         data["action"] = abs_action
+        return data
+
+
+def _eef_arm_blocks(state_desc) -> list[tuple[slice, int]]:
+    """Locate ``6 x EEF + 1 x GRIPPER`` arm blocks in a state descriptor.
+
+    Args:
+        state_desc: Per-dimension state descriptors.
+
+    Returns:
+        One ``(eef_slice, gripper_index)`` pair per arm, in order.
+
+    Raises:
+        ValueError: If an EEF run is not a multiple of six, or is not followed by
+            a gripper dimension.
+    """
+    values = [_state_desc_value(desc) for desc in state_desc]
+    eef_id = _state_desc_value(RobotStateDesc.EEF)
+    gripper_id = _state_desc_value(RobotStateDesc.GRIPPER)
+
+    blocks = []
+    index = 0
+    while index < len(values):
+        if values[index] != eef_id:
+            index += 1
+            continue
+        start = index
+        while index < len(values) and values[index] == eef_id:
+            index += 1
+        run = index - start
+        if run % 6 != 0:
+            raise ValueError(
+                f"EEF run of length {run} at dim {start} is not a multiple of 6; "
+                "each arm must contribute exactly 3 position and 3 rotation dims"
+            )
+        for offset in range(start, index, 6):
+            gripper = offset + 6
+            if gripper >= len(values) or values[gripper] != gripper_id:
+                raise ValueError(
+                    f"EEF block at dim {offset} is not followed by a gripper dim; "
+                    "the expected layout is [xyz, axis-angle, gripper] per arm"
+                )
+            blocks.append((slice(offset, offset + 6), gripper))
+        # Skip the gripper dim that terminated the final block of this run.
+        index = max(index, blocks[-1][1] + 1)
+
+    return blocks
+
+
+# Relative SE(3) actions carry [translation(3), rot6d(6), gripper(1)] per arm.
+RELATIVE_SE3_DIMS_PER_ARM = 10
+# Absolute SE(3) targets carry [translation(3), axis-angle(3), gripper(1)] per arm,
+# matching the end-effector state layout on disk and on the wire.
+ABSOLUTE_SE3_DIMS_PER_ARM = 7
+
+
+class ActionRelativeSE3:
+    """Encode action targets as body-frame SE(3) transforms of the current pose.
+
+    For every arm block this produces ``T_current^-1 @ T_target`` -- the UMI
+    relative-trajectory action -- as ``[translation, rot6d, gripper]``. Gripper
+    commands stay absolute.
+
+    This differs from :class:`ActionRelative`, which subtracts the state
+    elementwise and therefore expresses the delta in the *base* frame with an
+    axis-angle difference standing in for a rotation composition. Both are used
+    in the literature; the body-frame form is the one that makes actions
+    invariant to the world frame and to an uncalibrated robot base, because the
+    anchor and the target are re-expressed together.
+
+    Dimensions tagged ``RobotStateDesc.AUX`` are observation-only and are
+    dropped from the action targets.
+
+    Raises:
+        AssertionError: If required state, action, or metadata fields are missing.
+        ValueError: If ``state_desc`` contains no end-effector arm block.
+    """
+
+    def __str__(self):
+        return "ActionRelativeSE3()"
+
+    def __call__(self, data, **kw):
+        del kw
+        assert "state" in data and "action" in data, (
+            "Both state and action must be present to compute relative action"
+        )
+        assert "meta_data" in data and "state_desc" in data["meta_data"], (
+            "state_desc must be present in meta_data to compute relative action"
+        )
+
+        state = np.asarray(data["state"], dtype=np.float64)
+        action = np.asarray(data["action"], dtype=np.float64)
+        blocks = _eef_arm_blocks(data["meta_data"]["state_desc"])
+        if not blocks:
+            raise ValueError(
+                "ActionRelativeSE3 requires at least one EEF arm block in state_desc"
+            )
+
+        parts = []
+        for eef_slice, gripper in blocks:
+            anchor = se3.pos_rotvec_to_transform(state[eef_slice])
+            target = se3.pos_rotvec_to_transform(action[..., eef_slice])
+            relative = se3.relative_transform(anchor, target)
+            parts.append(se3.transform_to_pos_rot6d(relative))
+            parts.append(action[..., gripper : gripper + 1])
+
+        data["action"] = np.concatenate(parts, axis=-1).astype(np.float32)
+        data["action_mask"] = np.ones_like(data["action"], dtype=bool)
+        return data
+
+
+class ActionAbsoluteSE3:
+    """Decode :class:`ActionRelativeSE3` targets back to absolute poses.
+
+    Returns ``[xyz, axis-angle, gripper]`` per arm, matching the end-effector
+    state layout, so the width of the decoded action is
+    :data:`ABSOLUTE_SE3_DIMS_PER_ARM` per arm rather than the
+    :data:`RELATIVE_SE3_DIMS_PER_ARM` the model predicts.
+
+    Raises:
+        AssertionError: If required state, action, or metadata fields are missing.
+    """
+
+    def __str__(self):
+        return "ActionAbsoluteSE3()"
+
+    def __call__(self, data, **kw):
+        del kw
+        assert "state" in data and "action" in data, (
+            "Both state and action must be present to compute absolute action"
+        )
+        assert "meta_data" in data and "state_desc" in data["meta_data"], (
+            "state_desc must be present in meta_data to compute absolute action"
+        )
+
+        state = np.asarray(data["state"], dtype=np.float64)
+        action = np.asarray(data["action"], dtype=np.float64)
+        blocks = _eef_arm_blocks(data["meta_data"]["state_desc"])
+
+        parts = []
+        for index, (eef_slice, _) in enumerate(blocks):
+            offset = index * RELATIVE_SE3_DIMS_PER_ARM
+            anchor = se3.pos_rotvec_to_transform(state[eef_slice])
+            relative = se3.pos_rot6d_to_transform(action[..., offset : offset + 9])
+            absolute = se3.absolute_transform(anchor, relative)
+            parts.append(se3.transform_to_pos_rotvec(absolute))
+            parts.append(action[..., offset + 9 : offset + 10])
+
+        data["action"] = np.concatenate(parts, axis=-1).astype(np.float32)
         return data
 
 

@@ -282,6 +282,7 @@ class DM05DataConfig(Config):
     image_dir: str | None = field(default=None)
     n_bins: int = field(default=256)
     action_mode: ActionMode = field(default=ActionMode.RELATIVE)
+    relative_mode: Literal["vector", "se3"] = field(default="vector")
     compute_norm_stats_max_batches: int | None = field(default=None)
     norm_stats_root: str = field(default="./norm_stats")
     norm_stats_default_robot_type: str | None = field(default=None)
@@ -318,6 +319,7 @@ class DM05DataConfig(Config):
         return BuildAction(
             action_horizon=action_horizon,
             action_mode=self.action_mode,
+            relative_mode=self.relative_mode,
         )
 
     def norm_stats_path(self, action_horizon: int) -> pathlib.Path:
