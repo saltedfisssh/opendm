@@ -119,6 +119,45 @@ class DM05InferenceConfig(_DM05InferenceConfig):
     )
     dataset_name: str = field(default="piper_fold_s0")
 
+    def _initialize(self, **kwargs):
+        # The robot host decodes the rung-specific deltas against its exact
+        # observation anchor. Generic ActionAbsolute cannot decode SE(3).
+        kwargs["use_absolute_action"] = False
+        if self.compose_eef_rot:
+            raise ValueError("Piper wire state already contains rotation vectors")
+        super()._initialize(**kwargs)
+
+    def _infer_legacy(self):
+        from flask import jsonify
+
+        return (
+            jsonify({"error": "Use the Piper /v1/infer protocol and piper_rollout.py"}),
+            400,
+        )
+
+    def _infer(self):
+        from flask import jsonify, request
+        from opendm.deploy.piper import contract
+
+        spec = contract(self.dataset_name.removeprefix("piper_fold_"))
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or body.get("piper") != spec:
+            return (
+                jsonify(
+                    {
+                        "error": "Piper client/server representation mismatch",
+                        "piper": spec,
+                    }
+                ),
+                400,
+            )
+        response = super()._infer()
+        if isinstance(response, tuple):
+            return response
+        payload = response.get_json()
+        payload["metadata"]["piper"] = spec
+        return jsonify(payload)
+
     def _request_default_overrides(self) -> dict:
         from opendm.constants.robot import RobotType
 
@@ -141,6 +180,20 @@ class DM05Exp(_DM05Exp):
     trainer_config: DM05TrainerConfig = field(default_factory=DM05TrainerConfig)
     data_config: DM05DataConfig = field(default_factory=DM05DataConfig)
     inference_config: DM05InferenceConfig = field(default_factory=DM05InferenceConfig)
+
+    def _initialize_inference_runtime(self):
+        from opendm.deploy.piper import contract
+
+        name = self.data_config.dataset_name
+        spec = contract(name.removeprefix("piper_fold_"))
+        expected = "se3" if spec["action_dim"] == 20 else "vector"
+        if self.data_config.relative_mode != expected:
+            raise ValueError(f"{name} requires --data-config.relative-mode {expected}")
+        if self.data_config.action_mode != ActionMode.RELATIVE:
+            raise ValueError("Piper deployment requires relative-action training")
+        self.inference_config.dataset_name = name
+        self.inference_config.output_action_dim = spec["action_dim"]
+        super()._initialize_inference_runtime()
 
 
 if __name__ == "__main__":

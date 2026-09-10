@@ -90,14 +90,14 @@ script/dm05_launcher.sh --exp playground/dm05_piper.py --task train --nproc_per_
     --data-config.dataset-name piper_fold_s0 \
     --model-config.model-name-or-path ./checkpoints/DM05-MEM \
     --trainer-config.output-dir user_checkpoints/piper_s0 \
-    --wandb-project opendm
+    --trainer-config.wandb-project opendm
 
 # S2 / S3 / S3a 额外加 --data-config.relative-mode se3
 script/dm05_launcher.sh --exp playground/dm05_piper.py --task train --nproc_per_node 8 \
     --data-config.dataset-name piper_fold_s2 --data-config.relative-mode se3 \
     --model-config.model-name-or-path ./checkpoints/DM05-MEM \
     --trainer-config.output-dir user_checkpoints/piper_s2 \
-    --wandb-project opendm
+    --trainer-config.wandb-project opendm
 
 # 4. 离线统一空间评测
 python script/piper_eval_offline.py \
@@ -284,7 +284,12 @@ python script/piper_compute_norm_stats.py --rung s5
 
 ## 8. 真机 rollout 注意事项
 
-- **S0 / S5（关节）**：直接下发关节角。`pyAgxArm` CAN 层单位 **0.001 度**。
+云端与本地的完整命令见 [Piper 真机部署](piper_deployment.md)，本地入口为
+`script/piper_rollout.py`，云端继续使用 `playground/dm05_piper.py`。
+
+- **S0（关节）**：直接下发真实关节角。**S5** 的关节属于估计虚拟 base，部署必须使用训练时的
+  `estimated_bases.json` 映射观测和目标，不能直接下发。`pyAgxArm` CAN 层单位 **0.001 度**，
+  但高层 `move_j` 接收弧度，客户端不要重复换算。
 - **S1 / S2 / S3（EEF）**：下发末端位姿，用**固件 IK**（`arm_end_pose_ctrl`，X/Y/Z 单位 0.001 mm、
   RX/RY/RZ 单位 0.001 度），避免自研 IK 与固件约定不一致。
 - `qpos_ee` 是 **flange** 位姿、TCP offset = 0，客户端不要重复加夹爪偏移。

@@ -178,3 +178,5 @@ playground/user
 
 flash_attn-2.8.3-cp310-cp310-linux_x86_64.whl
 norm_stats
+
+results/
