@@ -177,7 +177,7 @@ def test_server_contract_and_no_generic_absolute(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "failure", ["http", "contract", "nan", "stale", "success", "dry_run"]
+    "failure", ["http", "contract", "nan", "stale", "camera", "success", "dry_run"]
 )
 def test_rollout_failure_stops_without_sending(monkeypatch, failure):
     import requests
@@ -208,7 +208,12 @@ def test_rollout_failure_stops_without_sending(monkeypatch, failure):
 
     class Camera:
         def __init__(self, *args):
-            pass
+            self.checks = 0
+
+        def check_fresh(self, *args):
+            self.checks += 1
+            if failure == "camera" and self.checks == 3:
+                raise RuntimeError("RealSense disconnected before playback")
 
         def image(self, *args):
             return "jpeg"
@@ -271,7 +276,7 @@ def test_rollout_failure_stops_without_sending(monkeypatch, failure):
     if failure in ("success", "dry_run"):
         module.main()
     else:
-        with pytest.raises((requests.Timeout, ValueError, TimeoutError)):
+        with pytest.raises((requests.Timeout, ValueError, TimeoutError, RuntimeError)):
             module.main()
     if failure == "dry_run":
         assert "enable" not in calls and "stop" not in calls

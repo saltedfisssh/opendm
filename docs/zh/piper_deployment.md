@@ -40,17 +40,39 @@ Piper 的 `/v1/infer` 使用专用协议：请求增加 `piper` 对象，服务�
 
 ## 本地安装与连接
 
-将本仓库和 `third_party/pyAgxArm` 目录复制到机械臂机器，创建独立环境：
+将本仓库和 `third_party/pyAgxArm` 目录复制到机械臂机器。已有 uv 环境包含
+`pyrealsense2` 时直接复用，无需重新建训练环境；以下命令用 `uv run --no-sync`
+运行当前环境，避免部署时自动同步云端训练依赖。
+
+如果是新部署机器，可安装本地最小依赖：
 
 ```bash
-python3 -m venv .venv-piper
-source .venv-piper/bin/activate
-pip install numpy requests opencv-python
-pip install -e third_party/pyAgxArm
+uv venv .venv
+uv pip install numpy requests opencv-python-headless pyrealsense2
+uv pip install -e third_party/pyAgxArm
 ```
 
-SDK 目录需完整存在；当前它是工作区中已有的第三方目录。
-从仓库根目录运行脚本，不需要 `pip install -e .` 安装云端训练依赖。
+OpenCV 仅用于 JPEG 编码，图像采集全部通过 `pyrealsense2`，不使用
+`VideoCapture` 或 V4L2 设备编号。若环境已有 OpenCV，不必再安装 headless 版本。
+若导入 SDK 报 `libusb-1.0.so.0` 缺失，Ubuntu/Debian 本地机器执行
+`sudo apt-get install libusb-1.0-0`；相机访问权限按 RealSense 的 udev 配置处理。
+SDK 目录需完整存在；从仓库根目录运行脚本，无需安装云端模型依赖。
+
+在**连接相机的本地机械臂机器**枚举设备：
+
+```bash
+uv run --no-sync python script/piper_list_cameras.py
+```
+
+脚本输出 JSON，包含 `serial`、设备名、USB 类型及支持的彩色分辨率、帧率和格式，
+只枚举设备，不启动图像流或连接机械臂。无设备时输出 `[]` 并以状态码 1 退出。
+根据实际安装位置填写三个序列号，不能把枚举顺序当成相机角色：
+
+```bash
+HEAD_SERIAL=实际头部相机序列号
+LEFT_SERIAL=实际左腕相机序列号
+RIGHT_SERIAL=实际右腕相机序列号
+```
 
 按实际设备配置 SocketCAN，例：
 
@@ -60,24 +82,25 @@ sudo ip link set can1 up type can bitrate 1000000
 ```
 
 `can0` 是左从臂、`can1` 是右从臂，不能接主臂。
-相机使用 V4L2 设备编号或 `/dev/v4l/by-id/...` 稳定路径，顺序必须与训练一致，
-分辨率要求 640×480。应使用相同机架、相机视角和夹爪；S3/S3a 使用数据约定的
+相机通过 `--cameras` 按 **Head / Left wrist / Right wrist** 顺序传入三个不同的
+RealSense 序列号，保留前导零。每路仅开启 **640×480、30 FPS、BGR8 彩色流**，
+不启用深度或红外；设备不支持该模式时直接报错，不自动替换相机或分辨率。应使用相同机架、相机视角和夹爪；S3/S3a 使用数据约定的
 右 base 相对左 base `[0, -0.60, 0]`。不能在换了外参的机架上直接复用。
 用 `--firmware default|v183|v188|v189` 选择与机械臂实际固件对应的 SDK profile。
 
 先运行一次只观测与解码（不会使能或下发运动）：
 
 ```bash
-python script/piper_rollout.py --server http://CLOUD_IP:7891 --rung s2 \
-  --left-can can0 --right-can can1 --cameras 0 2 4 --cycles 1
+uv run --no-sync python script/piper_rollout.py --server http://CLOUD_IP:7891 --rung s2 \
+  --left-can can0 --right-can can1 --cameras "$HEAD_SERIAL" "$LEFT_SERIAL" "$RIGHT_SERIAL" --cycles 1
 ```
 
 输出 JSON 包含请求耗时和解码后的执行前缀。确认相机顺序、反馈、动作方向后，
 在有人看护且可使用实体急停的条件下执行：
 
 ```bash
-python script/piper_rollout.py --server http://CLOUD_IP:7891 --rung s2 \
-  --left-can can0 --right-can can1 --cameras 0 2 4 \
+uv run --no-sync python script/piper_rollout.py --server http://CLOUD_IP:7891 --rung s2 \
+  --left-can can0 --right-can can1 --cameras "$HEAD_SERIAL" "$LEFT_SERIAL" "$RIGHT_SERIAL" \
   --execute --speed 10 --steps 5 --cycles 0
 ```
 
@@ -102,8 +125,8 @@ python script/piper_rollout.py --server http://CLOUD_IP:7891 --rung s2 \
 S5 必须传训练时的虚拟 base 文件：
 
 ```bash
-python script/piper_rollout.py --server http://CLOUD_IP:7891 --rung s5 \
-  --cameras 0 2 4 --bases data/piper_fold_cloth/estimated_bases.json
+uv run --no-sync python script/piper_rollout.py --server http://CLOUD_IP:7891 --rung s5 \
+  --cameras "$HEAD_SERIAL" "$LEFT_SERIAL" "$RIGHT_SERIAL" --bases data/piper_fold_cloth/estimated_bases.json
 ```
 
 S5 在真实 FK → world → 虚拟 base 的位姿上求 IK 构造观测；预测的虚拟关节经
@@ -114,7 +137,14 @@ FK → world → 真实 base 后用固件 IK 执行。不能直接下发虚拟�
 ## 时序和停止条件
 
 采用同步请求、30 Hz 执行前缀、再观测的闭环，默认每次执行 5/50 步。
-相机后台持续读取以减少缓存积压。请求期间不继续发送旧 chunk；这会有网络与
+每路 RealSense 使用独立 pipeline 和后台线程持续取帧，只缓存最新的彩色图像。
+默认丢弃前 15 帧进行曝光预热，`--camera-warmup-frames` 可修改；
+`--camera-startup-timeout` 默认 10 秒，限制 pipeline 启动后等待有效预热帧的时间。
+三路就绪后才连接机械臂，使能前再次检查图像新鲜度。SDK 断流、图像过期或
+格式异常会使 rollout 失败，运动执行期间也会逐步检查相机状态。退出时停止三路 pipeline。
+BGR8 直接编码 JPEG，云端正常解码为 RGB，客户端不要额外交换颜色通道。
+图像年龄使用本机单调时钟记录的收帧时间，重复帧号不会刷新年龄；三路是独立彩色流，
+不声称具备硬件同步，跨相机时钟同步或精确曝光对齐需要额外实现。请求期间不继续发送旧 chunk；这会有网络与
 推理等待停顿，不能当作 RTC 延迟补偿。对比实验需固定网络、steps 和速度。
 
 `--timeout` 默认 2 秒，同时限制请求与观测到返回结果的年龄；watchdog

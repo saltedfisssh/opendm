@@ -2,7 +2,6 @@
 """Run a cloud Piper policy on local cameras and pyAgxArm CAN drivers."""
 
 import argparse
-import base64
 from contextlib import ExitStack
 import json
 from pathlib import Path
@@ -17,53 +16,7 @@ import numpy as np
 from opendm.deploy.piper import RUNGS, Representation, validate_motion
 from opendm.data import se3
 from opendm.kinematics import piper
-
-
-class Camera:
-    """Continuously drain capture buffers; timestamp only successfully read frames."""
-
-    def __init__(self, source):
-        import cv2
-
-        self.cv2 = cv2
-        self.capture = cv2.VideoCapture(int(source) if source.isdecimal() else source)
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        if not self.capture.isOpened():
-            self.capture.release()
-            raise RuntimeError(f"Cannot open camera {source}")
-        self.lock = threading.Lock()
-        self.latest = None
-        self.closed = threading.Event()
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-
-    def _run(self):
-        while not self.closed.is_set():
-            ok, frame = self.capture.read()
-            if not ok:
-                return
-            with self.lock:
-                self.latest = (time.monotonic(), frame)
-
-    def image(self, max_age):
-        with self.lock:
-            if self.latest is None or time.monotonic() - self.latest[0] > max_age:
-                raise RuntimeError("Missing or stale camera frame")
-            frame = self.latest[1].copy()
-        if frame.shape[:2] != (480, 640):
-            raise RuntimeError(
-                f"Camera must supply training resolution 640x480, got {frame.shape}"
-            )
-        ok, jpeg = self.cv2.imencode(".jpg", frame, [self.cv2.IMWRITE_JPEG_QUALITY, 95])
-        if not ok:
-            raise RuntimeError("JPEG encoding failed")
-        return base64.b64encode(jpeg).decode("ascii")
-
-    def close(self):
-        self.closed.set()
-        self.thread.join(timeout=1)
-        self.capture.release()
+from opendm.deploy.realsense import RealSenseCamera as Camera
 
 
 class Robot:
@@ -156,7 +109,23 @@ def main():
         "--firmware", default="default", choices=["default", "v183", "v188", "v189"]
     )
     parser.add_argument(
-        "--cameras", nargs=3, required=True, metavar=("HEAD", "LEFT", "RIGHT")
+        "--cameras",
+        nargs=3,
+        required=True,
+        metavar=("HEAD_SERIAL", "LEFT_SERIAL", "RIGHT_SERIAL"),
+        help="RealSense serial numbers in Head / Left wrist / Right wrist order",
+    )
+    parser.add_argument(
+        "--camera-startup-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for color frames after starting each camera",
+    )
+    parser.add_argument(
+        "--camera-warmup-frames",
+        type=int,
+        default=15,
+        help="Discard this many color frames per camera before use",
     )
     parser.add_argument("--bases", type=Path, help="S5 training estimated_bases.json")
     parser.add_argument(
@@ -194,8 +163,12 @@ def main():
         and 0 < args.feedback_age <= 2
         and 1 <= args.speed <= 100
         and 0 < args.force <= 5
+        and 0 < args.camera_startup_timeout <= 60
+        and 0 <= args.camera_warmup_frames <= 300
     ):
-        parser.error("Invalid steps/cycles/timeout/feedback-age/speed/force")
+        parser.error(
+            "Invalid steps/cycles/timeout/feedback-age/speed/force/camera settings"
+        )
     if args.left_can == args.right_can or len(set(args.cameras)) != 3:
         parser.error("Use distinct CAN interfaces and three distinct cameras")
     rep = Representation(
@@ -208,12 +181,17 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: halt.set())
     with ExitStack() as stack:
         session = stack.enter_context(requests.Session())
-        robot = Robot([args.left_can, args.right_can], args.firmware, stack)
         cameras = []
         for source in args.cameras:
-            camera = Camera(source)
+            camera = Camera(
+                source, args.camera_startup_timeout, args.camera_warmup_frames
+            )
             stack.callback(camera.close)
             cameras.append(camera)
+        # Validate all streams before connecting or enabling either arm.
+        for camera in cameras:
+            camera.check_fresh(args.feedback_age)
+        robot = Robot([args.left_can, args.right_can], args.firmware, stack)
         lock = threading.Lock()
         deadline = [time.monotonic() + 10]
         watchdog_done = threading.Event()
@@ -235,6 +213,8 @@ def main():
             robot.feedback(args.feedback_age)
             time.sleep(args.feedback_age + 0.05)
             robot.feedback(args.feedback_age)
+            for camera in cameras:
+                camera.check_fresh(args.feedback_age)
             if args.execute:
                 robot.enable(args.speed, halt, lock)
             cycle = 0
@@ -294,6 +274,8 @@ def main():
                             robot.feedback(args.feedback_age), joint_mode
                         )
                         validate_motion(command[None], current, joint_mode)
+                        for camera in cameras:
+                            camera.check_fresh(args.feedback_age)
                         if args.execute:
                             robot.send(command, joint_mode, args.force)
                     halt.wait(max(0, playback + (index + 1) / 30 - time.monotonic()))
