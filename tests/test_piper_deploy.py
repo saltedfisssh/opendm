@@ -197,6 +197,9 @@ def test_rollout_failure_stops_without_sending(monkeypatch, failure):
         def feedback(self, *args):
             return joints()
 
+        def wait_ready(self, *args):
+            pass
+
         def enable(self, *args):
             calls.append("enable")
 
@@ -284,3 +287,73 @@ def test_rollout_failure_stops_without_sending(monkeypatch, failure):
         assert "stop" in calls
     assert calls.count("send") == (1 if failure == "success" else 0)
     assert calls.count("camera_close") == 3
+
+
+def load_rollout():
+    spec = importlib.util.spec_from_file_location(
+        "rollout_config_test", Path(__file__).parents[1] / "script/piper_rollout.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_deployment_defaults_and_firmware_alias():
+    parser = load_rollout().build_argparser()
+    args = parser.parse_args(["--server", "http://cloud:7891", "--rung", "s0"])
+    assert (args.left_can, args.right_can) == ("can_l_slave", "can_r_slave")
+    assert args.cameras == ["346522076596", "346522072780", "346522075577"]
+    assert args.firmware == "v189"
+    assert not args.execute
+    assert (
+        parser.parse_args(
+            ["--server", "http://cloud", "--rung", "s0", "--firmware", "V189"]
+        ).firmware
+        == "v189"
+    )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--server", "http://cloud", "--rung", "s0", "--execute", "--dry-run"]
+        )
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_wait_ready_requires_feedback_progress(monkeypatch, frozen):
+    module = load_rollout()
+    robot = module.Robot.__new__(module.Robot)
+    robot.stamps = {}
+    tick = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: tick[0])
+
+    class Halt:
+        def is_set(self):
+            return False
+
+        def wait(self, seconds):
+            tick[0] += seconds
+
+    def feedback(age):
+        if tick[0] == 0:
+            raise RuntimeError("Feedback not received yet")
+        for key in ("0:q", "0:g", "1:q", "1:g"):
+            robot.stamps[key] = (1 if frozen and key == "1:g" else tick[0], tick[0])
+
+    robot.feedback = feedback
+    if frozen:
+        with pytest.raises(TimeoutError, match="live dual-arm feedback"):
+            robot.wait_ready(0.5, 0.1, Halt())
+    else:
+        robot.wait_ready(0.5, 0.1, Halt())
+
+
+def test_invalid_right_arm_action_rejected_before_left_send():
+    module = load_rollout()
+    robot = module.Robot.__new__(module.Robot)
+    calls = []
+    robot.arms = [SimpleNamespace(move_j=lambda values: calls.append(values))] * 2
+    robot.grippers = [SimpleNamespace(move_gripper_m=lambda *a, **kw: None)] * 2
+    command = joints()
+    command[7] = np.nan
+    with pytest.raises(ValueError):
+        robot.send(command, True, 1)
+    assert not calls

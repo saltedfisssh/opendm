@@ -13,7 +13,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
-from opendm.deploy.piper import RUNGS, Representation, validate_motion
+from opendm.deploy.piper import RUNGS, Representation, finite_array, validate_motion
 from opendm.data import se3
 from opendm.kinematics import piper
 from opendm.deploy.realsense import RealSenseCamera as Camera
@@ -21,7 +21,7 @@ from opendm.deploy.realsense import RealSenseCamera as Camera
 
 class Robot:
     def __init__(self, channels, firmware, stack):
-        from pyAgxArm import AgxArmFactory, create_agx_arm_config
+        from pyAgxArm import AgxArmFactory, ArmModel, PiperFW, create_agx_arm_config
 
         self.arms = []
         self.grippers = []
@@ -29,7 +29,10 @@ class Robot:
         for channel in channels:
             arm = AgxArmFactory.create_arm(
                 create_agx_arm_config(
-                    robot="piper", channel=channel, firmeware_version=firmware
+                    robot=ArmModel.PIPER,
+                    channel=channel,
+                    interface="socketcan",
+                    firmeware_version=getattr(PiperFW, firmware.upper()),
                 )
             )
             self.arms.append(arm)
@@ -64,8 +67,34 @@ class Robot:
                     raise RuntimeError(f"Stale feedback: {key}")
             if g.msg.mode != "width":
                 raise RuntimeError("Gripper feedback must use width mode")
-            result.extend([*q.msg, g.msg.value])
+            angles = finite_array(q.msg, (6,))
+            width = float(g.msg.value)
+            if not np.isfinite(width) or not 0 <= width <= 0.08:
+                raise RuntimeError(f"Invalid gripper width on arm {i}: {width}")
+            result.extend([*angles, width])
         return np.asarray(result)
+
+    def wait_ready(self, max_age, timeout, halt):
+        """Wait for asynchronous feedback and require both arms to update."""
+        deadline = time.monotonic() + timeout
+        initial = None
+        error = None
+        while not halt.is_set():
+            try:
+                self.feedback(max_age)
+                stamps = {key: value[0] for key, value in self.stamps.items()}
+                if initial is None:
+                    initial = stamps
+                elif all(stamps[key] != stamp for key, stamp in initial.items()):
+                    return
+            except (RuntimeError, ValueError) as exc:
+                error = exc
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for live dual-arm feedback"
+                ) from error
+            halt.wait(0.02)
+        raise RuntimeError("Stopped while waiting for arm feedback")
 
     def enable(self, speed, halt, lock):
         deadline = time.monotonic() + 5
@@ -83,6 +112,7 @@ class Robot:
             arm.set_speed_percent(speed)
 
     def send(self, command, joint_mode, force):
+        command = finite_array(command, (14,))
         for i, (arm, gripper) in enumerate(zip(self.arms, self.grippers)):
             values = command[i * 7 : i * 7 + 6].tolist()
             (arm.move_j if joint_mode else arm.move_p)(values)
@@ -99,19 +129,22 @@ def current_command(joints, joint_mode):
     return result
 
 
-def main():
+def build_argparser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", required=True, help="http://IP:port (or HTTPS URL)")
     parser.add_argument("--rung", choices=RUNGS, required=True)
-    parser.add_argument("--left-can", default="can0")
-    parser.add_argument("--right-can", default="can1")
+    parser.add_argument("--left-can", default="can_l_slave")
+    parser.add_argument("--right-can", default="can_r_slave")
     parser.add_argument(
-        "--firmware", default="default", choices=["default", "v183", "v188", "v189"]
+        "--firmware",
+        type=str.lower,
+        default="v189",
+        choices=["default", "v183", "v188", "v189"],
     )
     parser.add_argument(
         "--cameras",
         nargs=3,
-        required=True,
+        default=["346522076596", "346522072780", "346522075577"],
         metavar=("HEAD_SERIAL", "LEFT_SERIAL", "RIGHT_SERIAL"),
         help="RealSense serial numbers in Head / Left wrist / Right wrist order",
     )
@@ -132,7 +165,13 @@ def main():
         "--prompt",
         default="Task: fold the cloth. Scene: internal. Type: teleop. Quality: 5.",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Observe and infer without enabling or moving; requires devices",
+    )
+    mode.add_argument(
         "--execute",
         action="store_true",
         help="Enable arms and send commands; default observes only",
@@ -149,17 +188,22 @@ def main():
     parser.add_argument(
         "--timeout",
         type=float,
-        default=2,
+        default=30,
         help="HTTP timeout and maximum observation age, seconds",
     )
     parser.add_argument("--feedback-age", type=float, default=0.5)
     parser.add_argument("--speed", type=int, default=10, help="SDK speed percent")
     parser.add_argument("--force", type=float, default=1, help="Gripper force in N")
+    return parser
+
+
+def main():
+    parser = build_argparser()
     args = parser.parse_args()
     if not (
         1 <= args.steps <= 50
         and args.cycles >= 0
-        and 0 < args.timeout <= 10
+        and 0 < args.timeout <= 120
         and 0 < args.feedback_age <= 2
         and 1 <= args.speed <= 100
         and 0 < args.force <= 5
@@ -171,6 +215,20 @@ def main():
         )
     if args.left_can == args.right_can or len(set(args.cameras)) != 3:
         parser.error("Use distinct CAN interfaces and three distinct cameras")
+    from urllib.parse import urlsplit
+
+    endpoint = urlsplit(args.server)
+    if endpoint.scheme not in ("http", "https") or not endpoint.netloc:
+        parser.error("--server must be an HTTP(S) URL")
+    if (
+        endpoint.path.rstrip("/") not in ("", "/v1/infer")
+        or endpoint.query
+        or endpoint.fragment
+    ):
+        parser.error("--server must be a base URL or a full /v1/infer URL")
+    inference_url = args.server.rstrip("/")
+    if not inference_url.endswith("/v1/infer"):
+        inference_url += "/v1/infer"
     rep = Representation(
         args.rung, json.loads(args.bases.read_text()) if args.bases else None
     )
@@ -209,10 +267,7 @@ def main():
         worker.start()
         try:
             # Prime feedback freshness tracking before any enabling or inference.
-            time.sleep(1)
-            robot.feedback(args.feedback_age)
-            time.sleep(args.feedback_age + 0.05)
-            robot.feedback(args.feedback_age)
+            robot.wait_ready(args.feedback_age, 5.0, halt)
             for camera in cameras:
                 camera.check_fresh(args.feedback_age)
             if args.execute:
@@ -229,7 +284,7 @@ def main():
                 joints = robot.feedback(args.feedback_age)
                 state = rep.observe(joints)
                 response = session.post(
-                    args.server.rstrip("/") + "/v1/infer",
+                    inference_url,
                     json={
                         "piper": rep.spec,
                         "observation": {
@@ -242,7 +297,10 @@ def main():
                 )
                 response.raise_for_status()
                 body = response.json()
-                if body.get("metadata", {}).get("piper") != rep.spec:
+                if not isinstance(body, dict):
+                    raise ValueError("Server response must be a JSON object")
+                metadata = body.get("metadata")
+                if not isinstance(metadata, dict) or metadata.get("piper") != rep.spec:
                     raise ValueError("Server response representation contract mismatch")
                 commands = rep.decode(state, body["actions"])
                 if len(commands) < args.steps:

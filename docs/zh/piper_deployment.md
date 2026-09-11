@@ -66,33 +66,36 @@ uv run --no-sync python script/piper_list_cameras.py
 
 脚本输出 JSON，包含 `serial`、设备名、USB 类型及支持的彩色分辨率、帧率和格式，
 只枚举设备，不启动图像流或连接机械臂。无设备时输出 `[]` 并以状态码 1 退出。
-根据实际安装位置填写三个序列号，不能把枚举顺序当成相机角色：
+当前部署默认绑定以下三路相机，不能把枚举顺序当成相机角色：
 
 ```bash
-HEAD_SERIAL=实际头部相机序列号
-LEFT_SERIAL=实际左腕相机序列号
-RIGHT_SERIAL=实际右腕相机序列号
+HEAD_SERIAL=346522076596
+LEFT_SERIAL=346522072780
+RIGHT_SERIAL=346522075577
 ```
 
 按实际设备配置 SocketCAN，例：
 
 ```bash
-sudo ip link set can0 up type can bitrate 1000000
-sudo ip link set can1 up type can bitrate 1000000
+sudo ip link set can_l_slave up type can bitrate 1000000
+sudo ip link set can_r_slave up type can bitrate 1000000
 ```
 
-`can0` 是左从臂、`can1` 是右从臂，不能接主臂。
+`can_l_slave` 是左从臂、`can_r_slave` 是右从臂，不能接主臂。
 相机通过 `--cameras` 按 **Head / Left wrist / Right wrist** 顺序传入三个不同的
 RealSense 序列号，保留前导零。每路仅开启 **640×480、30 FPS、BGR8 彩色流**，
 不启用深度或红外；设备不支持该模式时直接报错，不自动替换相机或分辨率。应使用相同机架、相机视角和夹爪；S3/S3a 使用数据约定的
 右 base 相对左 base `[0, -0.60, 0]`。不能在换了外参的机架上直接复用。
-用 `--firmware default|v183|v188|v189` 选择与机械臂实际固件对应的 SDK profile。
+默认固件为 `v189`，与 `test.py` 的 `PiperFW.V189` 一致；可用
+`--firmware default|v183|v188|v189` 覆盖，也接受大写名称。
+CAN 后端显式使用 `socketcan`。上述 CAN 名称与三路序列号已是脚本默认值，
+因此命令中的 `--left-can`、`--right-can`、`--cameras` 均可省略。
 
 先运行一次只观测与解码（不会使能或下发运动）：
 
 ```bash
 uv run --no-sync python script/piper_rollout.py --server http://CLOUD_IP:7891 --rung s2 \
-  --left-can can0 --right-can can1 --cameras "$HEAD_SERIAL" "$LEFT_SERIAL" "$RIGHT_SERIAL" --cycles 1
+  --left-can can_l_slave --right-can can_r_slave --cameras "$HEAD_SERIAL" "$LEFT_SERIAL" "$RIGHT_SERIAL" --cycles 1
 ```
 
 输出 JSON 包含请求耗时和解码后的执行前缀。确认相机顺序、反馈、动作方向后，
@@ -100,7 +103,7 @@ uv run --no-sync python script/piper_rollout.py --server http://CLOUD_IP:7891 --
 
 ```bash
 uv run --no-sync python script/piper_rollout.py --server http://CLOUD_IP:7891 --rung s2 \
-  --left-can can0 --right-can can1 --cameras "$HEAD_SERIAL" "$LEFT_SERIAL" "$RIGHT_SERIAL" \
+  --left-can can_l_slave --right-can can_r_slave --cameras "$HEAD_SERIAL" "$LEFT_SERIAL" "$RIGHT_SERIAL" \
   --execute --speed 10 --steps 5 --cycles 0
 ```
 
@@ -140,14 +143,14 @@ FK → world → 真实 base 后用固件 IK 执行。不能直接下发虚拟�
 每路 RealSense 使用独立 pipeline 和后台线程持续取帧，只缓存最新的彩色图像。
 默认丢弃前 15 帧进行曝光预热，`--camera-warmup-frames` 可修改；
 `--camera-startup-timeout` 默认 10 秒，限制 pipeline 启动后等待有效预热帧的时间。
-三路就绪后才连接机械臂，使能前再次检查图像新鲜度。SDK 断流、图像过期或
+三路就绪后才连接机械臂，使能前最多等待 5 秒，确认双臂关节与夹爪反馈时间戳均更新，再检查图像新鲜度。SDK 断流、图像过期或
 格式异常会使 rollout 失败，运动执行期间也会逐步检查相机状态。退出时停止三路 pipeline。
 BGR8 直接编码 JPEG，云端正常解码为 RGB，客户端不要额外交换颜色通道。
 图像年龄使用本机单调时钟记录的收帧时间，重复帧号不会刷新年龄；三路是独立彩色流，
 不声称具备硬件同步，跨相机时钟同步或精确曝光对齐需要额外实现。请求期间不继续发送旧 chunk；这会有网络与
 推理等待停顿，不能当作 RTC 延迟补偿。对比实验需固定网络、steps 和速度。
 
-`--timeout` 默认 2 秒，同时限制请求与观测到返回结果的年龄；watchdog
+`--timeout` 默认 30 秒（可设置 0–120 秒，不含 0），同时限制请求与观测到返回结果的年龄；watchdog
 独立处理超时和信号。`--feedback-age` 默认 0.5 秒，检测反馈时间戳停止变化和
 相机帧过期。完整执行前缀在发送前校验，执行时再对当前反馈校验。
 默认单步最大关节差 0.15 rad、位置差 25 mm、旋转差 0.15 rad、夹爪差 20 mm，
@@ -156,3 +159,23 @@ BGR8 直接编码 JPEG，云端正常解码为 RGB，客户端不要额外交换
 这些检查不包含双臂碰撞、桌面碰撞或任务空间障碍检测，也不能替代实体急停。
 代码测试使用仿真反馈和 HTTP 测试客户端；实际 CAN、相机同步、固件动作和
 checkpoint 的成功率需在设备上验证。
+
+## 与参考脚本的区别及无设备验证
+
+参考 `test.py` 的 SDK 连接方式，扩展为左右两臂；状态与命令始终按
+`[左臂 6 关节, 左夹爪, 右臂 6 关节, 右夹爪]` 排列。图像键 `1/2/3`
+对应头部／左腕／右腕。当前训练夹爪使用真实宽度（米），不能复制参考脚本的
+0/1 夹爪状态或用最后一次指令冒充反馈。启动不会回零或自动张开夹爪。
+
+服务使用本仓库的 `/v1/infer` 相对动作协议，不是参考脚本的
+`/process_frame` multipart 协议。`--server` 接受基础 URL 或完整 `/v1/infer` URL。
+默认只观测，也可显式传 `--dry-run`；它仍需要相机、CAN 和推理服务，
+与 `--execute` 互斥。无设备机器只运行以下帮助和模拟测试，不运行 rollout：
+
+```bash
+uv run --no-sync python script/piper_rollout.py --help
+uv run --no-sync python -m pytest tests/test_piper_deploy.py tests/test_piper_realsense.py -q
+```
+
+测试环境需安装 pytest；其中服务协议测试还需要云端训练依赖。
+仅有本地最小依赖时可加 `-k "not server_contract"` 跳过服务端测试。
