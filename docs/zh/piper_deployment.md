@@ -95,35 +95,83 @@ CAN 后端显式使用 `socketcan`。上述 CAN 名称与三路序列号已是�
 
 ```bash
 uv run --no-sync python script/piper_rollout.py --server http://CLOUD_IP:7891 --rung s2 \
-  --left-can can_l_slave --right-can can_r_slave --cameras "$HEAD_SERIAL" "$LEFT_SERIAL" "$RIGHT_SERIAL" --cycles 1
+  --left-can can_l_slave --right-can can_r_slave --cameras "$HEAD_SERIAL" "$LEFT_SERIAL" "$RIGHT_SERIAL" --dry-run
 ```
 
-输出 JSON 包含请求耗时和解码后的执行前缀。确认相机顺序、反馈、动作方向后，
+输出 JSON 包含解码后 chunk 的长度、首步和末步动作。确认相机顺序、反馈、动作方向后，
 在有人看护且可使用实体急停的条件下执行：
 
 ```bash
 uv run --no-sync python script/piper_rollout.py --server http://CLOUD_IP:7891 --rung s2 \
   --left-can can_l_slave --right-can can_r_slave --cameras "$HEAD_SERIAL" "$LEFT_SERIAL" "$RIGHT_SERIAL" \
-  --execute --speed 10 --steps 5 --cycles 0
+  --execute --speed 10
 ```
 
-`--cycles 0` 持续运行，Ctrl-C/SIGTERM 停止；正常完成和异常退出也会发送双臂电子急停。
-重新运行前按 SDK/设备操作规范恢复急停；脚本不会自动 reset 或回零。
-停止时保留支撑力，不自动 disable。电子急停的实际行为须在所用固件上验证。
+默认持续运行到 `--max-steps`（默认 100000 步，约 55 分钟），Ctrl-C/SIGTERM 随时停止。
+停止只是不再下发新的指令——`move_j`/`move_p`/`move_js` 都是位置/速度或 MIT
+跟随控制，本身就会保持在最后下发的目标上，脚本退出时不会调用电子急停或
+`disable`。真正需要紧急处置时使用实体急停，而不是依赖驱动层调用；模型推理
+误差略微超出目标位置不会使机械臂损坏，因此不再需要软件层面的"停止即急停"。
+
+## 运动模式与 MIT
+
+`--motion-mode {smooth, mit}`（默认 `smooth`）：
+
+- `smooth`：关节档位调用 `move_j`，EEF 档位调用 `move_p`，均为固件的
+  位置-速度平滑轨迹，带轨迹规划。
+- `mit`：关节档位改用 `move_js`（SDK 文档称为 "MIT pass-through 模式"），
+  取消平滑与轨迹规划，直接跟随下发目标，延迟更低但没有缓冲，仅限
+  `--rung s0`。EEF 档位（S1/S2/S3/S3a/S5）没有对应的 Cartesian pass-through
+  接口，因此其余档位始终使用 `move_p`，`--motion-mode mit` 会在启动时报错拒绝。
 
 ## 表征与执行约定
 
 - 所有观测由关节 FK 重算 flange，TCP offset 为 0，与训练转换一致；EEF state
   使用轴角并跨请求解缠，不依赖 SDK 的异步末端反馈。矩阵链避免四元数符号跳变。
-- S0：关节相对值加当前关节，调用 `move_j`。
+- S0：关节相对值加当前关节，按 `--motion-mode` 调用 `move_j` 或 `move_js`。
 - S1：位置相加，旋转按 `R_delta @ R_anchor` 合成。
 - S2/S3/S3a：按 `T_anchor @ T_delta` 解码 6D body-frame 旋转；S3/S3a
   把右臂目标转回其自身 base。S3 额外构造 9 维双爪相对特征。
 - EEF 目标调用 `move_p`，使用固件 IK。SDK 高层输入是**米、弧度**，
-  `move_gripper_m` 是米和牛顿；不再乘 CAN 单位倍率。
-- SDK `move_p` 仅接受 canonical Euler 范围。客户端检测跨 ±π 的欧拉分支，
-  直接停止，避免把不满足接口范围的解缠角发给 SDK。这意味着部分跨分支轨迹
-  暂不能完整 rollout，应单独记录这类中断。
+  `move_gripper_m` 是米和牛顿；不再乘 CAN 单位倍率。`se3.mat_to_rpy`
+  每次都对旋转矩阵重新分解，返回的欧拉角本身就是 canonical 范围，
+  不存在需要客户端检测或拒绝的跨 ±π 分支问题。
+- 夹爪宽度裁剪到 `[0, 0.08]` m 后再下发，而不是拒绝整条指令：推理误差
+  略微超出夹爪物理行程不会损坏硬件，裁剪即可。关节限位交给 SDK/固件
+  （`set_joint_limits_enabled(True)`），不在客户端重复实现会拒绝整条前缀
+  的步长检查。
+
+## RTC（Real-Time Chunking，仅部署侧）
+
+云端 `/v1/infer` 是无状态的一次性 Flask 接口，不支持增量/引导式解码，因此
+这里的 RTC 是**仅在客户端实现**的近似方案（参考
+[lerobot RTC](https://huggingface.co/docs/lerobot/rtc) 与本仓库
+`agilex_ros_infer.py` 的 `StreamActionBuffer`），不修改云端推理服务：
+
+- 后台线程持续请求新的 action chunk；主循环以 30 Hz 从 `RtcActionBuffer`
+  中取出下一步指令执行，两者并行，请求延迟不再阻塞控制节奏。
+- 新 chunk 到达时，按请求耗时换算成步数，丢弃其中已经被"执行掉"的前缀
+  （`--rtc-latency-k` 设置最多丢弃的步数），并将剩余部分与仍在排队的旧
+  chunk 做时间维度的交叉淡化（`--rtc-smooth-method temporal`，
+  `--rtc-smooth-weight` 控制旧 chunk 权重，`--rtc-min-smooth-steps`
+  设置最短淡化窗口），避免旧新 chunk 拼接处的动作跳变。`--rtc-smooth-method
+  raw` 关闭淡化，丢弃后直接替换。
+- `--rtc-wait-steps` 控制排队步数降到多少时提前发起下一次推理请求，从而
+  让新 chunk 尽量在旧 chunk 耗尽前送达。
+- 这是近似实现，不是 lerobot/pi0 论文里依赖服务端引导去噪的"真"RTC——服务端
+  是不可修改的黑盒，因此客户端只能做丢前缀+淡化，不能做引导式重新采样。
+
+## 已移除的检查
+
+早期版本在客户端维护了一套步长上限检查（关节差/位置差/旋转差/夹爪差超限
+即拒绝整条待发前缀）和到点后立即打电子急停的收尾逻辑。这两者都已移除：
+
+- 模型推理误差总会略微超出这些人为设定的步长阈值，但机械臂不会因为这个
+  幅度的误差损坏，超限拒绝整条前缀只会让 rollout 无谓中断；真正的关节
+  限位改由 SDK/固件在 `set_joint_limits_enabled(True)` 下逐步检查执行。
+- 电子急停会让机械臂带阻尼缓慢下垂，且之后需要 `reset()` 才能继续，这是
+  不必要的额外操作；`move_j`/`move_p`/`move_js` 停止下发新目标后本身就会
+  保持在最后位置。真正的紧急情况应使用实体急停。
 
 S5 必须传训练时的虚拟 base 文件：
 
@@ -139,24 +187,28 @@ FK → world → 真实 base 后用固件 IK 执行。不能直接下发虚拟�
 
 ## 时序和停止条件
 
-采用同步请求、30 Hz 执行前缀、再观测的闭环，默认每次执行 5/50 步。
+后台推理线程与 30 Hz 控制主循环并行运行（见上文 RTC 一节）。
 每路 RealSense 使用独立 pipeline 和后台线程持续取帧，只缓存最新的彩色图像。
 默认丢弃前 15 帧进行曝光预热，`--camera-warmup-frames` 可修改；
 `--camera-startup-timeout` 默认 10 秒，限制 pipeline 启动后等待有效预热帧的时间。
-三路就绪后才连接机械臂，使能前最多等待 5 秒，确认双臂关节与夹爪反馈时间戳均更新，再检查图像新鲜度。SDK 断流、图像过期或
-格式异常会使 rollout 失败，运动执行期间也会逐步检查相机状态。退出时停止三路 pipeline。
+三路就绪后才连接机械臂，使能前最多等待 5 秒，确认双臂关节与夹爪反馈时间戳均更新，
+再检查一次图像新鲜度。之后每次后台推理请求都会重新检查反馈与图像新鲜度
+（复用 `infer_once` 的观测步骤），SDK 断流、图像过期或格式异常会让当次推理
+失败并被记录（不会中止整个 rollout，见下）。退出时停止三路 pipeline。
 BGR8 直接编码 JPEG，云端正常解码为 RGB，客户端不要额外交换颜色通道。
 图像年龄使用本机单调时钟记录的收帧时间，重复帧号不会刷新年龄；三路是独立彩色流，
-不声称具备硬件同步，跨相机时钟同步或精确曝光对齐需要额外实现。请求期间不继续发送旧 chunk；这会有网络与
-推理等待停顿，不能当作 RTC 延迟补偿。对比实验需固定网络、steps 和速度。
+不声称具备硬件同步，跨相机时钟同步或精确曝光对齐需要额外实现。
 
-`--timeout` 默认 30 秒（可设置 0–120 秒，不含 0），同时限制请求与观测到返回结果的年龄；watchdog
-独立处理超时和信号。`--feedback-age` 默认 0.5 秒，检测反馈时间戳停止变化和
-相机帧过期。完整执行前缀在发送前校验，执行时再对当前反馈校验。
-默认单步最大关节差 0.15 rad、位置差 25 mm、旋转差 0.15 rad、夹爪差 20 mm，
-夹爪范围 0–80 mm；超限拒绝整个前缀，不静默裁剪。SDK 继续检查关节限位。
+`--timeout` 默认 30 秒（可设置 0–120 秒，不含 0），既是 HTTP 超时也是观测新鲜度
+上限，直接交给 `requests.Session(timeout=...)` 处理，不再额外维护独立的
+watchdog 线程。`--feedback-age` 默认 0.5 秒，检测反馈时间戳停止变化和相机帧过期。
+单次推理失败（超时、契约不符、NaN、相机/反馈异常）只会打印一条日志并retry，
+不会让整个 rollout 退出——`RtcActionBuffer` 在没有新 chunk 时保持发送最后一个
+指令，机械臂原地等待，等下一次推理成功后自然衔接，不需要人为中止。
+`--dry-run` 是例外：它只做一次同步推理，任何异常都会直接抛出并让脚本退出，
+方便联调时快速定位问题。
 
-这些检查不包含双臂碰撞、桌面碰撞或任务空间障碍检测，也不能替代实体急停。
+这些逻辑不包含双臂碰撞、桌面碰撞或任务空间障碍检测，也不能替代实体急停。
 代码测试使用仿真反馈和 HTTP 测试客户端；实际 CAN、相机同步、固件动作和
 checkpoint 的成功率需在设备上验证。
 

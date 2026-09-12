@@ -2,6 +2,7 @@
 
 > 目标：在花钱采集 UMI 数据之前，先用**有完整真值的真机遥操数据**量化「UMI 所缺失的信息」各自值多少钱。
 > 相关调研见 [UMI 及相关工作调研](umi_survey.md)。
+> 使用已下载的 RoboTwin 2.0 数据进行 S0–S4 实验，见 [RoboTwin 2.0 表征消融适配](robotwin2_representation_ablation.md)；该方案暂不包含 S5。
 
 ## 0. 实验目标与汇报口径
 

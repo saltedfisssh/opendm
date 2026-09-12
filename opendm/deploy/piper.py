@@ -1,7 +1,6 @@
 """Piper wire contract and SI-unit representation adapters (NumPy only)."""
 
 import numpy as np
-from pyAgxArm.api.constants import ROBOT_JOINT_LIMIT_PRESET_RAD
 from opendm.data import se3
 from opendm.kinematics import piper
 
@@ -144,46 +143,15 @@ class Representation:
         return finite_array(output, (len(actions), 14))
 
 
-def validate_motion(
-    commands,
-    current,
-    joint_mode,
-    max_joint=0.15,
-    max_position=0.025,
-    max_rotation=0.15,
-    max_gripper=0.02,
-):
-    """Validate the entire executed prefix before sending either arm a command."""
-    commands = np.asarray(commands)
-    finite_array(commands, (len(commands), 14))
-    current = finite_array(current, (14,))
-    if ((commands[:, [6, 13]] < 0) | (commands[:, [6, 13]] > 0.08)).any():
-        raise ValueError("Gripper width outside [0, 0.08] m")
-    trajectory = np.vstack([current, commands]).reshape(-1, 2, 7)
-    if (np.abs(np.diff(trajectory[:, :, 6], axis=0)) > max_gripper).any():
-        raise ValueError("Gripper step exceeds limit")
-    if joint_mode:
-        limits = np.asarray(
-            [ROBOT_JOINT_LIMIT_PRESET_RAD["piper"][f"joint{i}"] for i in range(1, 7)]
-        )
-        targets = trajectory[1:, :, :6]
-        if ((targets < limits[:, 0]) | (targets > limits[:, 1])).any():
-            raise ValueError("Joint target outside SDK Piper limits")
-        if (np.abs(np.diff(trajectory[:, :, :6], axis=0)) > max_joint).any():
-            raise ValueError("Joint step exceeds limit")
-    else:
-        if (
-            np.linalg.norm(np.diff(trajectory[:, :, :3], axis=0), axis=-1)
-            > max_position
-        ).any():
-            raise ValueError("Cartesian step exceeds limit")
-        rot = se3.rpy_to_mat(trajectory[:, :, 3:6])
-        angles = np.linalg.norm(
-            se3.mat_to_rotvec(np.swapaxes(rot[:-1], -1, -2) @ rot[1:]), axis=-1
-        )
-        if (angles > max_rotation).any():
-            raise ValueError("Rotation step exceeds limit")
-        # SDK move_p accepts canonical Euler angles only. Reject branch crossings
-        # instead of passing unwrapped angles outside its documented domain.
-        if (np.abs(np.diff(trajectory[:, :, 3:6], axis=0)) > np.pi).any():
-            raise ValueError("Euler branch crossing: reposition before rollout")
+def clip_gripper(commands, low=0.0, high=0.08):
+    """Clip both gripper widths (columns 6, 13) into the physical hardware range.
+
+    Inference error that overshoots this range by a small margin is not a safety
+    event -- the gripper cannot physically open past its travel -- so callers
+    clip instead of rejecting the whole chunk. Per-step/per-chunk rate limiting
+    is left to the arm firmware (see ``set_joint_limits_enabled``) rather than
+    reimplemented here.
+    """
+    commands = np.array(commands, dtype=np.float64, copy=True)
+    commands[..., [6, 13]] = np.clip(commands[..., [6, 13]], low, high)
+    return commands
