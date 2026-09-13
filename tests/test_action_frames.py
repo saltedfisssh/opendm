@@ -7,9 +7,8 @@ These lock down the two properties the UMI-style representation is chosen for:
 * relative targets are invariant to the choice of world frame, which is what
   makes an arbitrary SLAM origin and an uncalibrated robot base drop out.
 
-The second property is why experiment S4 ("randomise the world frame") is a test
-rather than a training run: a frame-invariant pipeline produces identical targets
-under any world frame, so training on randomised frames cannot differ.
+The second property fixes S4 action targets under a common frame change.
+Absolute state inputs still change, so S4 requires a separate training run.
 """
 
 import numpy as np

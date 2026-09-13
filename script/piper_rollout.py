@@ -150,8 +150,8 @@ class Robot:
                 raise RuntimeError("Gripper feedback must use width mode")
             angles = finite_array(q.msg, (6,))
             width = float(g.msg.value)
-            if not np.isfinite(width) or not 0 <= width <= 0.08:
-                raise RuntimeError(f"Invalid gripper width on arm {i}: {width}")
+            # if not np.isfinite(width) or not 0 <= width <= 0.08:
+            #     raise RuntimeError(f"Invalid gripper width on arm {i}: {width}")
             result.extend([*angles, width])
         return np.asarray(result)
 

@@ -69,8 +69,10 @@ RUNG_STATE_DESCS = {
     "piper_fold_s0": PIPER_JOINT_STATE_DESC,
     "piper_fold_s1": PIPER_EEF_STATE_DESC,
     "piper_fold_s2": PIPER_EEF_STATE_DESC,
+    "piper_fold_s2_pair": PIPER_EEF_PAIR_STATE_DESC,
     "piper_fold_s3": PIPER_EEF_PAIR_STATE_DESC,
     "piper_fold_s3a": PIPER_EEF_STATE_DESC,
+    "piper_fold_s4": PIPER_EEF_STATE_DESC,
     "piper_fold_s5": PIPER_JOINT_STATE_DESC,
 }
 
@@ -84,6 +86,23 @@ class DM05DataConfig(_DM05DataConfig):
     # condition on -- and by different amounts per rung.
     add_state: bool = field(default=True)
     norm_stats_root: str = field(default="./norm_stats/piper")
+
+    def _dataset_info(self):
+        name = self.dataset_name
+        if name not in RUNG_STATE_DESCS:
+            raise ValueError(f"Unknown Piper ablation dataset: {name}")
+        expected = (
+            "se3"
+            if name.removeprefix("piper_fold_") in ("s2", "s2_pair", "s3a", "s3", "s4")
+            else "vector"
+        )
+        if self.relative_mode != expected:
+            raise ValueError(f"{name} requires relative_mode={expected}")
+        if self.action_mode != ActionMode.RELATIVE or not self.add_state:
+            raise ValueError(
+                "Piper ablations require relative actions and add_state=True"
+            )
+        return super()._dataset_info()
 
 
 @dataclass

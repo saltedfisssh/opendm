@@ -29,8 +29,10 @@ RUNG_RELATIVE_MODES = {
     "s0": "vector",
     "s1": "vector",
     "s2": "se3",
+    "s2_pair": "se3",
     "s3": "se3",
     "s3a": "se3",
+    "s4": "se3",
     "s5": "vector",
 }
 

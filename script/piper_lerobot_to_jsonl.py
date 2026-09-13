@@ -14,6 +14,9 @@ Representations
 ``eef_local``
     Per arm ``[xyz, axis-angle, gripper]`` in that arm's **own** base frame.
     14 dims.
+``eef_local_pair``
+    Local 14D state plus the shared-frame inter-gripper pose as 9D AUX.
+    Pair geometry matches eef_unified_pair, while actions match S2.
 ``eef_unified``
     Same layout, but the right arm is mapped into the left arm's base frame, so
     both arms live in one frame. 14 dims.
@@ -64,7 +67,13 @@ import pyarrow.parquet as pq
 from opendm.data import se3
 from opendm.kinematics import piper
 
-REPRESENTATIONS = ("joint", "eef_local", "eef_unified", "eef_unified_pair")
+REPRESENTATIONS = (
+    "joint",
+    "eef_local",
+    "eef_local_pair",
+    "eef_unified",
+    "eef_unified_pair",
+)
 
 # Camera keys in the capture, mapped to the image field order OpenDM expects.
 CAMERA_KEYS = (
@@ -130,6 +139,11 @@ def build_states(state: np.ndarray, representation: str) -> np.ndarray:
         right_gripper,
     ]
 
+    if representation == "eef_local_pair":
+        pair_right = piper.T_RIGHT_BASE_TO_LEFT_BASE @ right
+        blocks.append(
+            se3.transform_to_pos_rot6d(se3.relative_transform(left, pair_right))
+        )
     if representation == "eef_unified_pair":
         # Expressed in the left gripper's own frame, so it is independent of the
         # world frame and of the (here known, generally unknown) base offset.
@@ -140,7 +154,7 @@ def build_states(state: np.ndarray, representation: str) -> np.ndarray:
 
 def state_dim(representation: str) -> int:
     """Return the state width a representation produces."""
-    return 23 if representation == "eef_unified_pair" else 14
+    return 23 if representation in ("eef_unified_pair", "eef_local_pair") else 14
 
 
 def _video_field(episode_index: int, camera_key: str, frame_index: int) -> dict:

@@ -58,14 +58,14 @@ RUNG_REPRESENTATIONS = {
     "piper_fold_s0": "joint",
     "piper_fold_s1": "eef_local",
     "piper_fold_s2": "eef_local",
+    "piper_fold_s2_pair": "eef_local_pair",
     "piper_fold_s3": "eef_unified_pair",
     "piper_fold_s3a": "eef_unified",
+    "piper_fold_s4": "eef_gravity_random",
     "piper_fold_s5": "joint_estimated_base",
 }
 
-RELATIVE_MODES = {
-    name: spec["relative"] for name, spec in RUNG_DECODERS.items()
-}
+RELATIVE_MODES = {name: spec["relative"] for name, spec in RUNG_DECODERS.items()}
 
 
 def build_eval_dataset(
@@ -146,7 +146,7 @@ def read_absolute_states(
     state = np.asarray(orjson.loads(lines[frame_index])["state"], dtype=np.float64)
 
     future = []
-    last = None
+    last = state  # A terminal-frame sample repeats its current (final) state.
     terminal = len(lines) - 1
     for step in range(horizon):
         index = frame_index + 1 + step
@@ -240,11 +240,26 @@ def evaluate(
                 dataset, int(sample_index), action_horizon
             )
 
+            episode_frame = None
+            if dataset_name == "piper_fold_s4":
+                file_index, _ = dataset.sample_index[int(sample_index)]
+                episode_path = pathlib.Path(dataset.id_to_jsonl[file_index])
+                frames_path = episode_path.parents[2] / "episode_frames.json"
+                episode_frame = np.asarray(
+                    json.loads(frames_path.read_text())[episode_path.name]
+                )
             poses, grippers = decode_to_common_space(
-                dataset_name, raw_state, denormalized, state_desc
+                dataset_name,
+                raw_state,
+                denormalized,
+                state_desc,
+                episode_frame=episode_frame,
             )
             truth_poses, truth_grippers = ground_truth_common_space(
-                future, state_desc, unified=RUNG_DECODERS[dataset_name]["unified"]
+                future,
+                state_desc,
+                unified=RUNG_DECODERS[dataset_name]["unified"],
+                episode_frame=episode_frame,
             )
 
             predicted_poses.append(poses)

@@ -65,9 +65,10 @@
 | **S0** | 是 / 14 | 每臂 `[q_t,g_t]`，真实关节状态 | 每臂 `[q_{t+k}−q_t,g_{t+k}]` / 14 | **关节空间**，不适用 Cartesian base/body 系 | 基线 |
 | **S1** | 是 / 14 | 每臂 `[p_t,r_t,g_t]`，各自 `B_L/B_R` | 每臂 `[p_{t+k}−p_t,r_{t+k}−r_t,g_{t+k}]` / 14 | 位置差在各自 base 系；旋转为轴角向量差 | 对 S0：关节表征改为 FK 末端表征 |
 | **S2** | 是 / 14 | 同 S1，各自 `B_L/B_R` | 每臂 `[Δp,rot6d(ΔR),g_{t+k}]` / 20 | 各臂当前末端局部系，`ΔT=(T_t)⁻¹T_{t+k}` | 对 S1：动作编码由向量差改为 SE(3) 相对变换，同时旋转改为 6D |
+| **S2-pair** | 是 / 23 | S2 state + 当前 `T_L⁻¹T_R` 的 xyz + rot6d（9 维 AUX） | 同 S2 / 20 | 当前末端局部系 | 对 S2：只增加双手几何；对 S3：原 14 维 state 仍在各臂 base 系 |
 | **S3a** | 是 / 14 | 每臂 `[p_t,r_t,g_t]`，统一到 `W` | 同 S2 / 20 | 各臂当前末端局部系 | 对 S2：只统一 state 的参考系 |
 | **S3** | 是 / 23 | S3a 的 state + `T_L⁻¹T_R` 的 `[xyz,rot6d]`（9 维） | 同 S2 / 20 | 各臂当前末端局部系 | 对 S3a：只增加双末端相对位姿观测 |
-| **S4（新设计，待实现）** | 是 / 14 | 每臂 `[p_t,r_t,g_t]`，统一到 `G_e`；z 轴重力对齐，水平原点及 yaw 每 episode 随机 | 同 S2 / 20 | 各臂当前末端局部系 | 对 S3a：只移除跨 episode 固定的水平坐标参考；详见 §5 |
+| **S4（训练管线已实现）** | 是 / 14 | 每臂 `[p_t,r_t,g_t]`，统一到 `G_e`；z 轴重力对齐，水平原点及 yaw 每 episode 随机 | 同 S2 / 20 | 各臂当前末端局部系 | 对 S3a：只移除跨 episode 固定的水平坐标参考；详见 §5 |
 | **S5** | 是 / 14 | 每臂 `[q̂_t,g_t]`，由虚拟 base 下的 IK 重建 | 每臂 `[q̂_{t+k}−q̂_t,g_{t+k}]` / 14 | 虚拟机械臂的关节空间 | 对 S0：真实关节轨迹改为虚拟 base + IK 重建轨迹 |
 
 这里的对照顺序为 `S0 → S1 → S2 → S3a`，随后由 S3a 分出 S3 和 S4；S5 与 S0 比较。S1→S2 测的是整套动作编码选择，不能单独归因为 body-frame 的收益，因为旋转编码和输出维度也改变了。
@@ -162,7 +163,60 @@ S5 需要先估 base 再生成数据，见 §6 末。
 
 > **坑**：`DM05DataConfig.norm_stats_path` 的 digest 只哈希 `dataset_name` 和 action transform，
 > **不含** `state_desc`。所以每级必须用不同的 `dataset_name`，否则归一化统计会静默串用。
-> 现有 6 个注册名已满足这一点。
+> 现有 8 个注册名已满足这一点。
+
+### 8 卡服务器统一提交命令（较小每卡 batch）
+
+在 repo 根目录执行；先生成所选组的数据和独立统计（S4 见 §5，S5 见 §6）。下列命令保持 `8×2×8=128` 的全局 batch，60k steps、相同初始化、学习率及优化器；每卡 batch 比上面的旧默认 16 更小。这里是 Piper 的提交命令，本次小数据 GPU 冒烟验证针对 RoboTwin，未重新执行 Piper 训练。
+
+```bash
+export PATH="$PWD/.venv/bin:$PATH"
+export MODEL_PATH="$PWD/checkpoints/DM05-MEM"  # 所有组固定同一初始化
+export PIPER_OUTPUT_ROOT="$PWD/user_checkpoints/piper_ablation"
+
+# 按需保留某个 rung，即为该组的独立训练命令；完整列表会顺序占用同一组 8 卡
+set -euo pipefail
+mkdir -p results/piper_ablation
+for rung in s0 s1 s2 s2_pair s3a s3 s4; do
+  case "$rung" in
+    s0|s1) mode=vector ;;
+    s2|s2_pair|s3a|s3|s4) mode=se3 ;;
+  esac
+  bash script/dm05_launcher.sh --exp playground/dm05_piper.py \
+    --task train --nproc_per_node 8 \
+    --data-config.dataset-name "piper_fold_${rung}" \
+    --data-config.relative-mode "$mode" \
+    --model-config.model-name-or-path "$MODEL_PATH" \
+    --trainer-config.per-device-train-batch-size 2 \
+    --trainer-config.gradient-accumulation-steps 8 \
+    --trainer-config.num-train-steps 60000 \
+    --trainer-config.output-dir "$PIPER_OUTPUT_ROOT/$rung" \
+    2>&1 | tee "results/piper_ablation/train_${rung}.log"
+done
+```
+
+S5 完成数据与统计后，用相同命令参数、`--data-config.dataset-name piper_fold_s5 --data-config.relative-mode vector`、独立输出目录 `$PIPER_OUTPUT_ROOT/s5` 启动。所有组若进一步降低每卡 batch 为 1，累积步数一起改成 16；不要跨组改变有效 batch。迁移机器时确认 `piper_dual.py` 的源视频根目录可访问，派生 JSONL 缓存含绝对路径，应在目标端重建 `index_cache.json`。
+
+### S2-pair 的数据准备与训练
+
+组名为 `piper_fold_s2_pair`，磁盘表征为 `eef_local_pair`。保持 S2 原 14 维 state，利用已有 Piper 安装变换把两手变到同一系，只追加当前相对位姿 9 维 AUX；action 与 S2 一致，仍为 20 维 SE(3) 相对动作。新增特征与 S3 的尾部相同，对共同世界系变换不变。该安装关系仍沿用 Piper 的 0.60 m 安装假设，不是新的相机标定结果。
+
+```bash
+.venv/bin/python script/piper_lerobot_to_jsonl.py \
+  --out-root ./data/piper_fold_cloth --representation eef_local_pair --workers 15
+.venv/bin/python script/piper_compute_norm_stats.py --rung s2_pair --workers 15
+PATH="$PWD/.venv/bin:$PATH" bash script/dm05_launcher.sh \
+  --exp playground/dm05_piper.py --task train --nproc_per_node 8 \
+  --data-config.dataset-name piper_fold_s2_pair --data-config.relative-mode se3 \
+  --model-config.model-name-or-path ./checkpoints/DM05-MEM \
+  --trainer-config.per-device-train-batch-size 2 \
+  --trainer-config.gradient-accumulation-steps 8 \
+  --trainer-config.output-dir user_checkpoints/piper_ablation/s2_pair
+```
+
+转换复用原 `split.json`。原始 local state、视频和 prompt 保持一致；新注册独立统计 23 维 state，不得复用 S2 统计。离线评测已支持 `--dataset-name piper_fold_s2_pair`，按各臂自身 base 解码，AUX 不参与目标。当前 Piper 真机服务协议尚未加入此组；这里只实现训练和离线解码，不将 23 维 state 直接发送给原 S2 客户端。
+
+对照为 `S2 / S2-pair / S3a / S3` 的 2×2 组合（是否共享原 state 参考系 × 是否追加双手几何），见 RoboTwin 文档的 S2-pair 说明。
 
 ## 4. 为什么不能直接比 loss
 
@@ -217,7 +271,40 @@ T_t^{G_e} = H_e T_t^W
 
 body-frame action 在数值容差内不变，**输入的绝对位姿 state 改变**。因此 S4 测量的是失去跨 episode 固定水平参考后，模型利用 state 学习的能力。旧版“相对动作不变，所以训练不可能有差异”的推论忽略了 state 输入，本节替换该旧定义。
 
-现有 `tests/test_action_frames.py::test_relative_se3_targets_are_world_frame_invariant` 继续用于检查动作不变性；它不能替代 S4 训练。新增管线应检查：双臂共用变换、episode 内固定、state 确实变化、body action 与双臂相对位姿保持不变，以及解码后能经 `H_e⁻¹` 回到原共享系再做统一评测。S4 需独立数据注册与归一化统计；当前仓库尚未实现这些步骤。
+现有 `tests/test_action_frames.py::test_relative_se3_targets_are_world_frame_invariant` 继续用于检查动作不变性；它不能替代 S4 训练。新增管线的回归测试检查：双臂共用变换、episode 内固定、state 确实变化、body action 与双臂相对位姿保持不变，以及解码后能经 `H_e⁻¹` 回到原共享系再做统一评测。S4 已有独立数据注册、归一化统计入口和离线逆映射；对应回归测试见 `tests/test_representation_ablation.py`。
+
+### 已实现的转换与训练命令
+
+当前实现选择 **`C=I`，+z 向上**，与已有 S3a 数据保持同一重力符号；上方动画展示的 +z 向下是示意图约定，不是本次训练默认。默认 `yaw~U[-π,π)`、x/y 各 `U[-0.5,0.5] m`，z 平移为 0。SHA256(seed + episode 文件名) 确定每 episode 的随机变换，不依赖进程数或 Python hash。
+
+在 repo 根目录、OpenDM 环境中执行，复用已生成的 `eef_unified` 和原 `split.json`：
+
+```bash
+# 1. S3a → S4；保留原视频引用、prompt、夹爪米制标度和全部划分
+.venv/bin/python script/piper_prepare_s4.py \
+  --data-root ./data/piper_fold_cloth --seed 0 --s4-xy-range 0.5
+
+# 2. 只从 train 计算 S4 独立统计
+.venv/bin/python script/piper_compute_norm_stats.py --rung s4 --workers 15
+
+# 3. 与其他组共用初始化和训练超参
+PATH="$PWD/.venv/bin:$PATH" bash script/dm05_launcher.sh \
+  --exp playground/dm05_piper.py --task train --nproc_per_node 8 \
+  --data-config.dataset-name piper_fold_s4 --data-config.relative-mode se3 \
+  --model-config.model-name-or-path ./checkpoints/DM05-MEM \
+  --trainer-config.output-dir user_checkpoints/piper_s4
+
+# 4. 训练后评测；自动读取该 episode 的变换再映射回各臂 base
+.venv/bin/python script/piper_eval_offline.py \
+  --checkpoint user_checkpoints/piper_s4/checkpoint-60000 \
+  --dataset-name piper_fold_s4 --samples 512 --out results/s4.json
+```
+
+输出 `data/piper_fold_cloth/eef_gravity_random/` 下的 `jsonl/{train,held_out}`、`manifest.json`、`episode_frames.json` 和逐 episode 完成记录。转换原子落盘，可断点续跑；配置或源内容变化会拒绝复用旧结果。seed/随机范围/数据版本改变时须使用新的派生目录和 norm cache；`--data-root` 自定义目录后，训练还需覆盖 JSONL/image/norm 路径，现有 Piper 统计与离线 CLI 的默认目录仍是上面的标准目录。
+
+`decode_to_common_space(..., episode_frame=H_e)` 先解码到 G，再经 `H_e⁻¹` 回 W，最后将右臂换回自身 base。缺少 S4 变换时明确报错。不要单独复制 JSONL 而丢掉 `episode_frames.json`。
+
+**S4 真机 rollout 尚未接入**：现有 Piper 服务协议会拒绝 S4。部署前还需在 rollout 起始时选定固定 H，变换每次真实观测，并对预测执行同一个逆映射。本次完善到数据准备、训练、离线解码，不把数学逆映射等同于已完成硬件联调。
 
 ### 与 HiFi-UMI-2K 对齐到哪一层
 
@@ -229,7 +316,7 @@ body-frame action 在数值容差内不变，**输入的绝对位姿 state 改�
 | 顺序与旋转 | 右手在前、左手在后；旋转矩阵前两行的 6D 表示 | Piper 保持左→右；6D 行约定一致，接入时显式交换左右块 |
 | 夹爪 | 开口角，rad | Piper 开口宽度，m；需设备几何映射，不能直接互换 |
 | 末端原点 | 指尖 | Piper flange；接入时需标定局部轴和 flange→指尖变换 |
-| 世界系 | 双手和头部共享；原点任意；数据卡写明 `+Z` 与重力同向 | S4 双臂共享、z 符号显式统一；随机水平原点及 yaw |
+| 世界系 | 双手和头部共享；原点任意；数据卡写明 `+Z` 与重力同向 | S4 双臂共享，当前与 S3a 一起保留 +z 向上；随机水平原点及 yaw |
 | 高度原点 | 未规定跨 recording 的共同高度零点 | 主 S4 保留高度零点；`S4-origin` 才进一步消除此参考 |
 
 数据卡没有规定水平随机化的概率分布；这里的 episode 随机化是模拟坐标任意性的实验设计，不是声称数据发布方按该分布采样。**S4 对齐的是坐标信息假设，并非直接复刻 HiFi-UMI 的存储格式。** 若要比较 20 维 6D state，应让 S3a 与 S4 同时增加这一对照，避免把编码收益归入坐标随机化收益。
@@ -341,10 +428,12 @@ python script/piper_compute_norm_stats.py --rung s5
 | `opendm/data/se3.py` | SE(3)/旋转工具：四元数、轴角、rpy、**6D 旋转**（仓库原先没有）、序列解缠 |
 | `opendm/kinematics/piper.py` | 批量 FK、解析 Jacobian、DLS IK、多起点 IK、序列跟踪 IK、σ_min、双臂外参 |
 | `opendm/data/transforms.py` | 新增 `ActionRelativeSE3` / `ActionAbsoluteSE3`；`BuildAction` 新增 `relative_mode` |
-| `opendm/dataset/piper_dual.py` | 6 个阶梯的数据集注册 |
+| `opendm/dataset/piper_dual.py` | 8 个阶梯的数据集注册（含 S2-pair/S3a/S4） |
 | `opendm/eval/piper_common_space.py` | 跨表征统一空间解码器 + 指标 |
 | `playground/dm05_piper.py` | 训练/服务入口，单文件参数化 |
 | `script/piper_lerobot_to_jsonl.py` | LeRobot → OpenDM JSONL，含 4 种表征 |
+| `script/piper_prepare_s4.py` | S3a → 每 episode 固定水平换系的 S4，保存变换及源哈希 |
+| `opendm/data/episode_frame.py` | RoboTwin/Piper 共用 S4 变换与逆映射 |
 | `script/piper_compute_norm_stats.py` | 预计算各级归一化统计 |
 | `script/piper_estimate_root.py` | S5 虚拟 base 估计 + 误差报告 |
 | `script/piper_ik_to_joints.py` | S5 数据生成：按估计 base 做全量 IK → 关节 |
@@ -404,9 +493,9 @@ python script/piper_compute_norm_stats.py --rung s5
 
 ## 10. 当前状态与下一步
 
-以下运行数字与完成状态沿用此前实验记录，本次仅核对代码定义并修订文档，未重新运行训练、全量数据验证或硬件测试。S4 行反映本次新增设计的待实现状态。
+以下原有运行数字沿用此前实验记录。2026-09-12 新增 S4 转换、注册、统计入口和离线逆映射，并执行针对性测试；未开展 Piper S4 全量训练或硬件测试。
 
-### 已就绪（可直接开跑）
+### 已就绪（原有实验记录及新增入口）
 
 | 项 | 状态 |
 |---|---|
@@ -415,13 +504,15 @@ python script/piper_compute_norm_stats.py --rung s5
 | 训练入口 + 端到端跑通 | ✅ S0 与 S3 各跑通冒烟训练并存出 checkpoint |
 | 离线统一空间评测 | ✅ 在 S0 / S3 checkpoint 上出过表 |
 | 单元测试 | ✅ 73 条全绿（`pytest tests/ -q`） |
+| S4 转换、训练注册与离线逆映射代码 | ✅ 按 §5 执行，尚未全量运行 |
 | S5 的虚拟 base 估计 | ✅ `data/piper_fold_cloth/estimated_bases.json` |
 
 ### 未就绪
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| S4 的数据转换、注册、统计、评测及部署映射 | ❌ | 新定义已写入 §5，当前仍未实现训练管线 |
+| S4 全量数据生成、统计与训练 | ⏳ | 脚本和注册已实现，按 §5 执行；尚无完整训练结果 |
+| S4 真机 rollout | ❌ | 离线逆映射已实现，真机协议及客户端尚未接入 |
 | S5 的 JSONL 数据 | ⏸ 转换到 27/1255 时按要求停止 | 脚本支持断点续跑，重跑即可接上 |
 | S5 的归一化统计 | ❌ | 依赖上一项 |
 | 真机 rollout 客户端 | ❌ | 需求见 §8；无硬件无法验证，且要等模型训完 |
@@ -453,8 +544,8 @@ python script/piper_compute_norm_stats.py --rung s5
 跑完看报告里的 **branch flips**：抽验为 0.38–0.43%，远低于 5% 门槛，正常。
 若超过 5%，先修 `piper.ik_track` 再训练。
 
-**3. 按 S1 → S2 → S3a → S3 → S5 训练；S4 待 §5 管线补齐后与 S3a 比较**，超参与 S0 完全一致，只改
-`--data-config.dataset-name`（S2/S3/S3a 另加 `--data-config.relative-mode se3`）。
+**3. 按 S1 → S2 → S3a → S3 → S4 → S5 训练；S4 先按 §5 准备数据，并与 S3a 比较**，超参与 S0 完全一致，只改
+`--data-config.dataset-name`（S2/S3/S3a/S4 另加 `--data-config.relative-mode se3`）。
 
 **4. 离线统一空间评测出总表**，再挑 2-3 个代表上真机（真机客户端需按 §8 实现）。
 

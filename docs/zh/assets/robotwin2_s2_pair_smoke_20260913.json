@@ -1,0 +1,22 @@
+{
+  "rung": "s2_pair",
+  "gpu": "single A800 80GB",
+  "episodes": 20,
+  "frames": 2892,
+  "initialization": "/kpfs_ssd/data/wzy/data/Dexmal/DM05-MEM",
+  "steps": 2,
+  "batch_size": 1,
+  "gradient_accumulation_steps": 1,
+  "state_dim": 23,
+  "action_dim": 20,
+  "optimizer": "muon_adamw",
+  "checkpoint": "/root/opendm/user_checkpoints/robotwin2_s2_pair_smoke/s2_pair/checkpoint-2",
+  "losses_for_smoke_only": [
+    0.5641067028045654,
+    7.869572639465332
+  ],
+  "checked_parameter": "model.action_expert.final_time_modulator.weight",
+  "changed_parameter_elements": 868,
+  "max_parameter_change": 5.960464477539063e-08,
+  "passed": true
+}

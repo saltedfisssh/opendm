@@ -11,6 +11,7 @@ Rung    State                             Variable changed vs the previous rung
 ``s0``  joint angles, 14D                 baseline
 ``s1``  per-arm-base EEF, 14D             joint space -> end-effector space
 ``s2``  per-arm-base EEF, 14D             action delta convention -> UMI body frame
+``s2_pair`` local-frame EEF + pairing, 23D explicit arm coupling, retaining S2 state
 ``s3``  unified-frame EEF + pairing, 23D  one shared frame + explicit arm coupling
 ``s5``  joints from estimated base, 14D   known robot base -> base estimated from data
 ======  ================================  ==============================================
@@ -19,9 +20,9 @@ Rung    State                             Variable changed vs the previous rung
 ``--data-config.relative-mode``, which is what isolates the delta convention.
 ``s3a`` is an optional control that unifies the frame *without* adding the
 inter-gripper pairing, to separate those two effects if ``s3`` moves the needle.
-``s4`` is not a dataset: world-frame invariance is asserted in
-``tests/test_action_frames.py`` instead, because a frame-invariant pipeline
-produces bit-identical tensors under any world frame.
+``s4`` randomizes the shared horizontal origin and yaw once per episode.
+Its absolute state changes, while body-frame actions remain invariant.
+See ``script/piper_prepare_s4.py``; it requires separate normalization statistics.
 
 Every rung must keep a distinct dataset name. ``DM05DataConfig.norm_stats_path``
 hashes only the dataset name and the action transform, not ``state_desc``, so
@@ -83,10 +84,12 @@ register_dataset(
         # disk; the rungs differ only in how action deltas are formed.
         "s1": _entry("eef_local", PIPER_EEF_STATE_DESC, "eef"),
         "s2": _entry("eef_local", PIPER_EEF_STATE_DESC, "eef"),
+        "s2_pair": _entry("eef_local_pair", PIPER_EEF_PAIR_STATE_DESC, "eef"),
         # S3: one shared frame for both arms, plus the inter-gripper pose.
         "s3": _entry("eef_unified_pair", PIPER_EEF_PAIR_STATE_DESC, "eef"),
         # S3a: unified frame only, to isolate it from the pairing feature.
         "s3a": _entry("eef_unified", PIPER_EEF_STATE_DESC, "eef"),
+        "s4": _entry("eef_gravity_random", PIPER_EEF_STATE_DESC, "eef"),
         # S5: joints recovered by IK from a base pose estimated from the data.
         "s5": _entry("joint_estimated_base", PIPER_JOINT_STATE_DESC, "joint"),
     },

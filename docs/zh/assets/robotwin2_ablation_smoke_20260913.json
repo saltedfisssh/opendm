@@ -1,0 +1,93 @@
+{
+  "date": "2026-09-13",
+  "gpu": "A800 80GB, single GPU",
+  "episodes": 20,
+  "frames": 2892,
+  "initialization": "/kpfs_ssd/data/wzy/data/Dexmal/DM05-MEM",
+  "batch_size": 1,
+  "gradient_accumulation_steps": 1,
+  "optimizer": "muon_adamw",
+  "steps": 2,
+  "save_only_model": true,
+  "checked_parameter": "model.action_expert.final_time_modulator.weight",
+  "rungs": {
+    "s0": {
+      "checkpoint": "/root/opendm/user_checkpoints/robotwin2_smoke_20260913/s0/checkpoint-2",
+      "state_dim": 14,
+      "action_dim": 14,
+      "losses_for_smoke_only": [
+        0.3530925512313843,
+        0.9928317070007324
+      ],
+      "changed_parameter_elements": 893,
+      "max_parameter_change": 5.960464477539063e-08,
+      "norm_stats_sha256": "e65c84c44f045e0bff814a92f778a24004742620ce296691979676b03f30fa1e",
+      "passed": true
+    },
+    "s1": {
+      "checkpoint": "/root/opendm/user_checkpoints/robotwin2_smoke_20260913/s1/checkpoint-2",
+      "state_dim": 14,
+      "action_dim": 14,
+      "losses_for_smoke_only": [
+        0.11398612707853317,
+        0.8572766184806824
+      ],
+      "changed_parameter_elements": 845,
+      "max_parameter_change": 5.960464477539063e-08,
+      "norm_stats_sha256": "e7a76c187b09492bd3168644a641a50b00999e1c5a1e34f77c2c55ee549b23db",
+      "passed": true
+    },
+    "s2": {
+      "checkpoint": "/root/opendm/user_checkpoints/robotwin2_smoke_20260913/s2/checkpoint-2",
+      "state_dim": 14,
+      "action_dim": 20,
+      "losses_for_smoke_only": [
+        0.5781777501106262,
+        7.868278503417969
+      ],
+      "changed_parameter_elements": 871,
+      "max_parameter_change": 5.960464477539063e-08,
+      "norm_stats_sha256": "95196f8b804ce67715d4a4b57dfccb4d2ed182af41b4e6f66d010cf9fd0294a3",
+      "passed": true
+    },
+    "s3a": {
+      "checkpoint": "/root/opendm/user_checkpoints/robotwin2_smoke_20260913/s3a/checkpoint-2",
+      "state_dim": 14,
+      "action_dim": 20,
+      "losses_for_smoke_only": [
+        0.5752981901168823,
+        7.853407382965088
+      ],
+      "changed_parameter_elements": 855,
+      "max_parameter_change": 5.960464477539063e-08,
+      "norm_stats_sha256": "11e09338b0d4275b46729c8601da1351a557782fc3ed9523849f2c80040d200a",
+      "passed": true
+    },
+    "s3": {
+      "checkpoint": "/root/opendm/user_checkpoints/robotwin2_smoke_20260913/s3/checkpoint-2",
+      "state_dim": 23,
+      "action_dim": 20,
+      "losses_for_smoke_only": [
+        0.5674855709075928,
+        7.871977806091309
+      ],
+      "changed_parameter_elements": 862,
+      "max_parameter_change": 5.960464477539063e-08,
+      "norm_stats_sha256": "9522785cd1c05f9c77e7f115db0982a0e9640d7f90731bd3f732535783c648de",
+      "passed": true
+    },
+    "s4": {
+      "checkpoint": "/root/opendm/user_checkpoints/robotwin2_smoke_20260913/s4/checkpoint-2",
+      "state_dim": 14,
+      "action_dim": 20,
+      "losses_for_smoke_only": [
+        0.6144428849220276,
+        7.857995986938477
+      ],
+      "changed_parameter_elements": 850,
+      "max_parameter_change": 5.960464477539063e-08,
+      "norm_stats_sha256": "b3fd2e8c8347be94f86d38b7f6be07f740516e594d4081af387186d38525e038",
+      "passed": true
+    }
+  }
+}

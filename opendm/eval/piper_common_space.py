@@ -28,8 +28,10 @@ RUNG_DECODERS = {
     "piper_fold_s0": {"space": "joint", "relative": "vector", "unified": False},
     "piper_fold_s1": {"space": "eef", "relative": "vector", "unified": False},
     "piper_fold_s2": {"space": "eef", "relative": "se3", "unified": False},
+    "piper_fold_s2_pair": {"space": "eef", "relative": "se3", "unified": False},
     "piper_fold_s3": {"space": "eef", "relative": "se3", "unified": True},
     "piper_fold_s3a": {"space": "eef", "relative": "se3", "unified": True},
+    "piper_fold_s4": {"space": "eef", "relative": "se3", "unified": True},
     "piper_fold_s5": {"space": "joint", "relative": "vector", "unified": False},
 }
 
@@ -118,9 +120,7 @@ def decode_eef_rung(
             # The repo's base-frame convention: translations add, and rotations
             # compose in quaternion space rather than adding axis-angle vectors.
             position = state[eef_slice][:3] + action[:, eef_slice][:, :3]
-            rotation = (
-                se3.rotvec_to_mat(action[:, eef_slice][:, 3:6]) @ anchor[:3, :3]
-            )
+            rotation = se3.rotvec_to_mat(action[:, eef_slice][:, 3:6]) @ anchor[:3, :3]
             absolute = se3.make_transform(position, rotation)
             gripper_values = action[:, gripper]
 
@@ -138,6 +138,7 @@ def decode_to_common_space(
     state: np.ndarray,
     action: np.ndarray,
     state_desc,
+    episode_frame: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Dispatch to the decoder for ``dataset_name``.
 
@@ -151,15 +152,27 @@ def decode_to_common_space(
             f"known rungs: {sorted(RUNG_DECODERS)}"
         )
     spec = RUNG_DECODERS[dataset_name]
+    if dataset_name == "piper_fold_s4":
+        if episode_frame is None:
+            raise ValueError("S4 decoding requires the saved episode_frame (W to G)")
+        from opendm.data.episode_frame import undo_episode_frame
+
+        poses, grippers = decode_eef_rung(state, action, state_desc, "se3", False)
+        poses = undo_episode_frame(poses, episode_frame)
+        poses[:, 1] = (
+            se3.transform_inverse(piper.T_RIGHT_BASE_TO_LEFT_BASE) @ poses[:, 1]
+        )
+        return poses, grippers
     if spec["space"] == "joint":
         return decode_joint_rung(state, action, state_desc)
-    return decode_eef_rung(
-        state, action, state_desc, spec["relative"], spec["unified"]
-    )
+    return decode_eef_rung(state, action, state_desc, spec["relative"], spec["unified"])
 
 
 def ground_truth_common_space(
-    future_states: np.ndarray, state_desc, unified: bool
+    future_states: np.ndarray,
+    state_desc,
+    unified: bool,
+    episode_frame: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build reference poses straight from the held-out absolute states.
 
@@ -185,6 +198,10 @@ def ground_truth_common_space(
     poses, grippers = [], []
     for arm_index, (eef_slice, gripper) in enumerate(_eef_arm_blocks(state_desc)):
         pose = se3.pos_rotvec_to_transform(future_states[:, eef_slice])
+        if episode_frame is not None:
+            from opendm.data.episode_frame import undo_episode_frame
+
+            pose = undo_episode_frame(pose, episode_frame)
         if unified and ARM_NAMES[arm_index] == "right":
             pose = se3.transform_inverse(piper.T_RIGHT_BASE_TO_LEFT_BASE) @ pose
         poses.append(pose)
