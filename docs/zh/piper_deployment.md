@@ -2,8 +2,13 @@
 
 配合 [表征阶梯实验](piper_representation_ablation.md) 使用。云端加载 checkpoint，
 本地采集 Head / Left wrist / Right wrist 三路相机和双臂反馈，通过
-`http://IP:端口/v1/infer` 请求 action chunk，再由 `pyAgxArm` 控制双臂。
-本地无需 GPU、Torch 或模型权重。
+`http://IP:端口/v1/infer` 请求 action chunk，再控制双臂。本地无需 GPU、Torch 或模型权重。
+
+本地有两种客户端：`script/piper_rollout.py` 直连 SDK/CAN/RealSense（下面「本地安装与
+连接」到「时序和停止条件」几节）；`script/piper_ros_rollout.py` 复用机架上已经在跑的
+`web_console_bundle` 遥操作容器（roscore + 驱动 + 相机），走 ROS topic 而不直连硬件
+（见「ROS 部署」一节）。两者共用同一套云端协议、`Representation`、按 `--rung` 解码
+的逻辑，只是观测/控制的 IO 层不同；机架上已经跑着遥操作容器时优先用 ROS 版本。
 
 ## 云端
 
@@ -211,6 +216,132 @@ watchdog 线程。`--feedback-age` 默认 0.5 秒，检测反馈时间戳停止�
 这些逻辑不包含双臂碰撞、桌面碰撞或任务空间障碍检测，也不能替代实体急停。
 代码测试使用仿真反馈和 HTTP 测试客户端；实际 CAN、相机同步、固件动作和
 checkpoint 的成功率需在设备上验证。
+
+## ROS 部署（复用 web_console_bundle 的现有节点，不直连 CAN/RealSense）
+
+`script/piper_ros_rollout.py` 是上面 SDK 直连方案（`piper_rollout.py`）的替代实现，
+用于机架上已经跑着 `web_console_bundle` 遥操作容器（roscore + 双臂驱动 + 三路
+RealSense 均已启动）的场景：不再单独打开 CAN 口或连接相机，观测和控制全部走
+容器已经发布/订阅的 ROS topic，`/v1/infer` 协议、`Representation`、按 `--rung`
+解码这些和 SDK 版本完全一致，只是 IO 层换了。
+
+前提：容器已用 `bash run.sh start` 启动（例如 `xiaoyu` 用户下的
+`web_console_bundle`），`rostopic list` 能看到：
+
+- 观测：`/camera_f|l|r/color/image_raw`（`sensor_msgs/Image`，`rgb8`）、
+  `/puppet/joint_left|right`（`sensor_msgs/JointState`，7 维 = 6 关节 + 夹爪宽度，米）。
+- 控制：`/master/joint_left|right`（`JointState`，仅 `--rung s0` 使用）、
+  `/puppet/pos_cmd_left|right`（`piper_msgs/PosCmd`，其余 rung 使用）。
+
+### 在 opendm 的 venv 里跑 rospy
+
+系统 ROS 的 Python（3.8）无法 `import opendm`（本仓库的类型标注要求 Python ≥3.9），
+但 `rospy`/`sensor_msgs`/`rospkg` 都是纯 Python，没有编译依赖，因此脚本改为在
+opendm 自己的 Python 3.10 venv 里把这几个目录**追加**（不是前插）到 `sys.path`：
+
+```python
+sys.path.append("/opt/ros/noetic/lib/python3/dist-packages")  # rospy, sensor_msgs
+sys.path.append("/usr/lib/python3/dist-packages")              # rospkg
+sys.path.append("/home/wzy/web_console_bundle-master/dagger_agilex/devel/lib/python3/dist-packages")  # piper_msgs
+```
+
+顺序很关键：追加而不是前插，才能保证 venv 自带的 numpy/opendm 优先于系统里更旧的
+版本被解析，否则 numpy 的 C 扩展 ABI 会不匹配。`piper_msgs`（`PosCmd` 消息）没有
+apt 包，是 catkin 生成的绑定，来自本机已经 `catkin_make` 过的 `web_console_bundle`
+checkout；换一台部署机器时如果路径不同，需要改这一行，或者确认该机器上确实存在
+对应的 `devel/lib/python3/dist-packages/piper_msgs` 目录（内容和消息定义只要跟容器
+里跑的驱动一致即可，不需要用同一份 build 出的文件，ROS 按消息类型名 + md5 校验，
+不校验 build 来源）。
+
+### 为什么不直接用 SDK 的 `move_p`
+
+容器里的驱动节点已经通过 SocketCAN 持有 `can_l_slave`/`can_r_slave`；SocketCAN
+允许多个进程同时 bind 同一个接口，但 SDK 和 ROS 驱动同时下发指令会互相打架
+（两边各自维护 motion mode/使能状态，不是只读监听）。要用 SDK 就必须先停掉驱动的
+`piper_slave_left`/`piper_slave_right` 节点，退回 SDK 直连方案；否则应该用驱动已经
+订阅好的 ROS topic 代替 SDK 调用。
+
+### 控制路径：`s0` 走关节，其余 rung 走 `PosCmd`
+
+`/master/joint_*` 对应驱动里的 MIT/力控跟随（`move_mit`），只有一个弱低通
+（`0.3*旧+0.7*新`）和默认关闭的 jerk clamp，**没有真正的限速**——直接在这条通道上
+按 30 Hz 发布原始关节目标会出现动作幅度大、速度快、抓取前就已经移开的问题。这条
+通道只用于 `--rung s0`（关节空间，没有 Cartesian 含义，也就没有 `PosCmd` 可用）。
+
+其余 rung（`s1`/`s2`/`s3`/`s3a`/`s5`）解码出来本来就是每臂 `[x, y, z, roll, pitch,
+yaw, gripper]`（米、弧度），直接发布为 `piper_msgs/PosCmd` 到 `/puppet/pos_cmd_left|right`
+——这条 topic 目前空闲（默认无发布者），驱动侧 `pos_callback` 收到后做：
+
+```python
+self.piper.set_motion_mode('p')
+self.piper.set_speed_percent(50)       # 固件侧限速，不是客户端限速
+self.piper.move_p([x, y, z, roll, pitch, yaw])
+self.end_effector.move_gripper_m(value=max(0.0, gripper) - 0.002, force=1.0)
+```
+
+也就是驱动自己做 IK + 固件轨迹规划 + 夹爪，一条消息同时带姿态和夹爪；单位与
+`move_p` 的 SDK 约定（米、弧度）完全一致，不需要客户端再做单位换算。`mode1`/
+`mode2` 只在驱动里被打日志，不影响行为，脚本固定发 `0`/`0`。因此这条路径**不再需要
+客户端自己做 IK**（不用 `opendm.kinematics.piper.ik_track`），也就不存在 IK 不收敛/
+分支跳变需要拒绝整条前缀的问题——交给固件处理。
+
+### 用法
+
+```bash
+export ROS_MASTER_URI=http://机械臂机器IP:11311   # 或用 --ros-master-uri 覆盖
+
+# 一次推理，打印解码结果，不发布
+.venv/bin/python3 script/piper_ros_rollout.py --server http://CLOUD_IP:6666 --rung s2 --dry-run
+
+# 整段执行完再等下一次推理结果（lerobot 的 sync 模式，无重叠）
+.venv/bin/python3 script/piper_ros_rollout.py --server http://CLOUD_IP:6666 --rung s2 \
+  --rtc-mode sync --execute
+
+# 后台推理 + 延迟感知拼接混合（默认模式）
+.venv/bin/python3 script/piper_ros_rollout.py --server http://CLOUD_IP:6666 --rung s2 \
+  --rtc-mode chunked --execute
+```
+
+### RTC：两种模式，对应 lerobot 的 `sync`/`async` 语义
+
+云端 `/v1/infer` 无状态、一次性返回，不支持增量或引导式解码，这里的 RTC 和 SDK
+版本一样是纯客户端近似（参考 [lerobot RTC](https://huggingface.co/docs/lerobot/rtc)
+与 [Real robot smoothness 博客](https://alexander-soare.github.io/robotics/2025/08/05/smooth-as-butter-robot-policies.html)
+的术语，不是依赖模型去噪采样器逐步引导的"真"RTC——当前 checkpoint 用 FAST 自回归
+后端，没有 flow-matching 采样器可以介入，服务端也不可改）：
+
+- `--rtc-mode sync`：执行完整个 chunk 再阻塞等下一次推理，时序上永远连贯，
+  代价是 chunk 之间有一段停顿（几百毫秒到几秒，取决于服务端延迟）。
+- `--rtc-mode chunked`（默认）：后台线程持续推理，主循环以 `--feedback-age`/
+  `rep.spec["fps"]` 对应的节奏从 `RtcActionBuffer` 取下一步执行，新 chunk 到达时
+  与仍排队的旧 chunk 做拼接+淡化：
+  - 触发时机由**延迟自适应的 margin**决定（`rtc_trigger_margin`）：对最近几次
+    推理耗时做 EMA（`LATENCY_EMA_ALPHA=0.3`），乘安全系数 `1.3` 后取整，再夹在
+    `--rtc-min-margin`（默认 4）与 `--rtc-max-margin`（默认 45）之间——不用固定
+    小常数，是因为固定值一旦小于真实往返延迟（远程 GPU 常见 500ms~1s，相当于
+    15~30 步 @30fps）就会导致缓冲区耗尽、机械臂卡顿。
+  - 新 chunk 到达后，按实际耗时换算成步数丢弃其中已经"过期"的前缀，最多丢弃
+    `--rtc-latency-k`（默认 12，对应 lerobot 文档建议的 8-12 步 execution
+    horizon）步——故意保持较小，避免一次网络抖动直接跳过抓取/接近这种精细阶段。
+  - 剩余部分与旧 chunk 排队中的尾部做交叉淡化：`--rtc-smooth-curve`（默认
+    `exp`，lerobot 推荐的默认衰减形状；`linear`；`raw` 关闭淡化直接替换），
+    淡化窗口至少 `--rtc-min-smooth-steps`（默认 8）步，`--rtc-smooth-weight`
+    控制旧 chunk 权重（默认 1.0，即完全按曲线走；调小则整体偏向新 chunk）。
+
+调过 SDK 版本参数的话注意：ROS 版本把"何时触发下一次推理"（margin，延迟自适应）
+和"新 chunk 里丢多少步当作过期"（`--rtc-latency-k`，独立的小上限）解耦了，不要
+用同一个值控制两者——耦合在一起会导致 margin 被强行压到很小，缓冲区反复耗尽。
+
+### 已知限制 / 验证方式
+
+- `--rtc-mode sync` 是本次新增的"不开 RTC"选项：完全对应用户要的
+  "执行完所有动作后，等待推理结果再继续执行"，没有拼接/淡化，也没有后台线程。
+- 没有单元测试（硬件在环脚本），验证方式是 `--dry-run`（一次同步推理，任何异常
+  直接抛出退出）→ `--rtc-mode chunked` 不带 `--execute` 跑一段观察 `remain`/
+  `latency_ms` 日志是否健康（`remain` 不应长期贴近 0）→ 有人看护、可用实体急停
+  的条件下加 `--max-steps` 限制、带 `--execute` 短测。
+- 夹爪、关节限位、双臂/桌面碰撞检测均由驱动/固件负责，脚本本身不做限幅之外的
+  安全检查——和 SDK 版本"已移除的检查"一节是同样的设计取舍。
 
 ## 与参考脚本的区别及无设备验证
 
