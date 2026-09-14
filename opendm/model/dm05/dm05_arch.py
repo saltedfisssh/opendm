@@ -1325,7 +1325,9 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
             ),
             attention_mask=attention_mask,
             position_ids=position_ids,
-            state=initial_noise.detach().clone(),
+            # Eager decoding promotes the state to FP32 at its first update.
+            # Keep that precision between replays instead of rounding each step.
+            state=initial_noise.detach().to(MODEL_DTYPE).clone(),
             time=torch.ones(
                 int(initial_noise.shape[0]),
                 device=initial_noise.device,
@@ -1397,8 +1399,8 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
         x_t = profile.state
         if profile.action_mask is not None:
             x_t = x_t * profile.action_mask
-        suffix_embeds = self.model.action_in_proj(x_t)
-        adarms_cond = self._build_adarms_cond(profile.time, suffix_embeds.dtype)
+        suffix_embeds = self._action_input_proj(x_t)
+        adarms_cond = self._build_adarms_cond(profile.time)
         suffix_out = self.model.action_expert(
             suffix_embeds=suffix_embeds,
             attention_mask=profile.attention_mask,
@@ -1407,7 +1409,7 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
             prefix_cache_values=profile.prefix_cache_values,
             adarms_cond=adarms_cond,
         )
-        updated = x_t + self.model.action_out_proj(suffix_out) * (
+        updated = x_t + self._action_output_proj(suffix_out) * (
             -1.0 / profile.diffusion_steps
         )
         profile.state.copy_(updated)

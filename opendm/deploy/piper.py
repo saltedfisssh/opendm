@@ -4,7 +4,7 @@ import numpy as np
 from opendm.data import se3
 from opendm.kinematics import piper
 
-RUNGS = ("s0", "s1", "s2", "s3", "s3a", "s5")
+RUNGS = ("s0", "s1", "s2", "s2_pair", "s3", "s3a", "s4", "s5")
 PROTOCOL = "piper-relative-v1"
 
 
@@ -14,8 +14,8 @@ def contract(rung):
     return dict(
         protocol=PROTOCOL,
         rung=rung,
-        state_dim=23 if rung == "s3" else 14,
-        action_dim=20 if rung in ("s2", "s3", "s3a") else 14,
+        state_dim=23 if rung in ("s2_pair", "s3") else 14,
+        action_dim=20 if rung in ("s2", "s2_pair", "s3", "s3a", "s4") else 14,
         action_encoding="denormalized_relative",
         fps=30,
     )
@@ -29,12 +29,40 @@ def finite_array(value, shape):
 
 
 class Representation:
-    def __init__(self, rung, bases=None):
+    """Adapt one rollout; create a new instance at each episode boundary.
+
+    S4 requires a fixed W-to-G frame shared by both arms. The server consumes
+    state in G and returns body-relative actions, so it need not know this frame.
+    """
+
+    def __init__(self, rung, bases=None, *, episode_frame=None):
         self.spec = contract(rung)
         self.rung = rung
         self.previous = None
         self.virtual_joints = None
         self.real_bases = np.stack([np.eye(4), piper.T_RIGHT_BASE_TO_LEFT_BASE])
+        self.episode_frame = None
+        self._episode_frame_inverse = None
+        if rung == "s4":
+            if episode_frame is None:
+                raise ValueError("S4 requires a fixed episode_frame (W to G)")
+            frame = finite_array(episode_frame, (4, 4)).copy()
+            rotation = frame[:3, :3]
+            if not (
+                np.allclose(frame[3], [0, 0, 0, 1], atol=1e-8, rtol=0)
+                and np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-8, rtol=0)
+                and np.isclose(np.linalg.det(rotation), 1, atol=1e-8, rtol=0)
+                and np.allclose(frame[2], [0, 0, 1, 0], atol=1e-8, rtol=0)
+            ):
+                raise ValueError(
+                    "S4 episode_frame must be a rigid yaw/xy transform with +z up "
+                    "and zero z translation, matching training"
+                )
+            frame.setflags(write=False)
+            self.episode_frame = frame
+            self._episode_frame_inverse = se3.transform_inverse(frame)
+        elif episode_frame is not None:
+            raise ValueError("episode_frame only applies to S4")
         self.bases = None
         if rung == "s5":
             if bases is None:
@@ -74,8 +102,10 @@ class Representation:
                 joints[a * 7 : a * 7 + 6] = q
             self.virtual_joints = joints.reshape(2, 7)[:, :6].copy()
             return joints
-        if self.rung in ("s3", "s3a"):
+        if self.rung in ("s3", "s3a", "s4"):
             poses = self.real_bases @ poses
+        if self.rung == "s4":
+            poses = self.episode_frame @ poses
         state = np.concatenate(
             [
                 np.r_[se3.transform_to_pos_rotvec(poses[a]), joints[a * 7 + 6]]
@@ -90,10 +120,15 @@ class Representation:
                     )
                 )[-1]
         self.previous = state.copy()
-        if self.rung == "s3":
+        if self.rung in ("s2_pair", "s3"):
+            # S2-pair keeps its original 14 dimensions in each arm's own base.
+            # Only the AUX calculation uses a shared frame, as in training.
+            pair_poses = self.real_bases @ poses if self.rung == "s2_pair" else poses
             state = np.r_[
                 state,
-                se3.transform_to_pos_rot6d(se3.transform_inverse(poses[0]) @ poses[1]),
+                se3.transform_to_pos_rot6d(
+                    se3.transform_inverse(pair_poses[0]) @ pair_poses[1]
+                ),
             ]
         return state
 
@@ -135,7 +170,9 @@ class Representation:
                         se3.rotvec_to_mat(actions[:, s][:, 3:]) @ anchor[:3, :3],
                     )
                     output[:, a * 7 + 6] = actions[:, a * 7 + 6]
-                if self.rung in ("s3", "s3a"):
+                if self.rung == "s4":
+                    pose = self._episode_frame_inverse @ pose
+                if self.rung in ("s3", "s3a", "s4"):
                     pose = se3.transform_inverse(self.real_bases[a]) @ pose
             output[:, s] = np.concatenate(
                 [pose[:, :3, 3], se3.mat_to_rpy(pose[:, :3, :3])], axis=-1

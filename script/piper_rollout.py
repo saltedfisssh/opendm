@@ -24,12 +24,14 @@ import signal
 import sys
 import threading
 import time
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 from opendm.deploy.piper import RUNGS, Representation, clip_gripper, finite_array
 from opendm.data import se3
+from opendm.data.episode_frame import sample_episode_frame
 from opendm.kinematics import piper
 from opendm.deploy.realsense import RealSenseCamera as Camera
 
@@ -286,6 +288,19 @@ def build_argparser():
         help="Discard this many color frames per camera before use",
     )
     parser.add_argument("--bases", type=Path, help="S5 training estimated_bases.json")
+    s4 = parser.add_argument_group("S4 episode frame (fixed throughout this process)")
+    s4.add_argument(
+        "--s4-episode-id",
+        help="Reproducible frame identifier; default generates a new UUID per rollout",
+    )
+    s4.add_argument(
+        "--s4-seed", type=int, help="S4 frame sampling seed (default: 0, as in training)"
+    )
+    s4.add_argument(
+        "--s4-xy-range",
+        type=float,
+        help="S4 horizontal translation range in metres (default: 0.5, match training)",
+    )
     parser.add_argument(
         "--prompt",
         default="Task: fold the cloth. Scene: internal. Type: teleop. Quality: 5.",
@@ -392,8 +407,41 @@ def main():
     inference_url = args.server.rstrip("/")
     if not inference_url.endswith("/v1/infer"):
         inference_url += "/v1/infer"
+    episode_frame = None
+    if args.rung == "s4":
+        episode_id = (
+            args.s4_episode_id if args.s4_episode_id is not None else uuid.uuid4().hex
+        )
+        if not episode_id.strip():
+            parser.error("--s4-episode-id must not be empty")
+        seed = args.s4_seed if args.s4_seed is not None else 0
+        xy_range = args.s4_xy_range if args.s4_xy_range is not None else 0.5
+        try:
+            episode_frame = sample_episode_frame(episode_id, seed, xy_range)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(
+            json.dumps(
+                {
+                    "s4": {
+                        "episode_id": episode_id,
+                        "seed": seed,
+                        "xy_range_m": xy_range,
+                        "episode_frame": episode_frame.tolist(),
+                    }
+                }
+            ),
+            flush=True,
+        )
+    elif any(
+        value is not None
+        for value in (args.s4_episode_id, args.s4_seed, args.s4_xy_range)
+    ):
+        parser.error("--s4-* options only apply to --rung s4")
     rep = Representation(
-        args.rung, json.loads(args.bases.read_text()) if args.bases else None
+        args.rung,
+        json.loads(args.bases.read_text()) if args.bases else None,
+        episode_frame=episode_frame,
     )
     import requests
 

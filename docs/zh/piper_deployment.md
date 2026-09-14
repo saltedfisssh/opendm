@@ -4,11 +4,10 @@
 本地采集 Head / Left wrist / Right wrist 三路相机和双臂反馈，通过
 `http://IP:端口/v1/infer` 请求 action chunk，再控制双臂。本地无需 GPU、Torch 或模型权重。
 
-本地有两种客户端：`script/piper_rollout.py` 直连 SDK/CAN/RealSense（下面「本地安装与
-连接」到「时序和停止条件」几节）；`script/piper_ros_rollout.py` 复用机架上已经在跑的
-`web_console_bundle` 遥操作容器（roscore + 驱动 + 相机），走 ROS topic 而不直连硬件
-（见「ROS 部署」一节）。两者共用同一套云端协议、`Representation`、按 `--rung` 解码
-的逻辑，只是观测/控制的 IO 层不同；机架上已经跑着遥操作容器时优先用 ROS 版本。
+当前可运行的本地客户端是 `script/piper_rollout.py`，直连 SDK/CAN/RealSense。
+后文「ROS 部署」保留了复用 `web_console_bundle` 遥操作容器的方案记录，但当前仓库的
+`script/piper_ros_rollout.py` 是空文件，暂不能按该章节运行。S4 已接入共享
+`Representation` 和 SDK 客户端，以下 S4 命令使用 SDK 入口。
 
 ## 云端
 
@@ -29,8 +28,10 @@ script/dm05_launcher.sh --exp playground/dm05_piper.py --task inference \
 | S0 | piper_fold_s0 | vector | 14 | 14 |
 | S1 | piper_fold_s1 | vector | 14 | 14 |
 | S2 | piper_fold_s2 | se3 | 14 | 20 |
+| S2-pair | piper_fold_s2_pair | se3 | 23 | 20 |
 | S3 | piper_fold_s3 | se3 | 23 | 20 |
 | S3a | piper_fold_s3a | se3 | 14 | 20 |
+| S4 | piper_fold_s4 | se3 | 14 | 20 |
 | S5 | piper_fold_s5 | vector | 14 | 14 |
 
 更换实验时同时更换 dataset、relative-mode、checkpoint 和本地 `--rung`。
@@ -89,7 +90,7 @@ sudo ip link set can_r_slave up type can bitrate 1000000
 `can_l_slave` 是左从臂、`can_r_slave` 是右从臂，不能接主臂。
 相机通过 `--cameras` 按 **Head / Left wrist / Right wrist** 顺序传入三个不同的
 RealSense 序列号，保留前导零。每路仅开启 **640×480、30 FPS、BGR8 彩色流**，
-不启用深度或红外；设备不支持该模式时直接报错，不自动替换相机或分辨率。应使用相同机架、相机视角和夹爪；S3/S3a 使用数据约定的
+不启用深度或红外；设备不支持该模式时直接报错，不自动替换相机或分辨率。应使用相同机架、相机视角和夹爪；S2-pair/S3/S3a/S4 使用数据约定的
 右 base 相对左 base `[0, -0.60, 0]`。不能在换了外参的机架上直接复用。
 默认固件为 `v189`，与 `test.py` 的 `PiperFW.V189` 一致；可用
 `--firmware default|v183|v188|v189` 覆盖，也接受大写名称。
@@ -126,7 +127,7 @@ uv run --no-sync python script/piper_rollout.py --server http://CLOUD_IP:7891 --
   位置-速度平滑轨迹，带轨迹规划。
 - `mit`：关节档位改用 `move_js`（SDK 文档称为 "MIT pass-through 模式"），
   取消平滑与轨迹规划，直接跟随下发目标，延迟更低但没有缓冲，仅限
-  `--rung s0`。EEF 档位（S1/S2/S3/S3a/S5）没有对应的 Cartesian pass-through
+  `--rung s0`。EEF 档位（S1/S2/S2-pair/S3/S3a/S4/S5）没有对应的 Cartesian pass-through
   接口，因此其余档位始终使用 `move_p`，`--motion-mode mit` 会在启动时报错拒绝。
 
 ## 表征与执行约定
@@ -137,6 +138,10 @@ uv run --no-sync python script/piper_rollout.py --server http://CLOUD_IP:7891 --
 - S1：位置相加，旋转按 `R_delta @ R_anchor` 合成。
 - S2/S3/S3a：按 `T_anchor @ T_delta` 解码 6D body-frame 旋转；S3/S3a
   把右臂目标转回其自身 base。S3 额外构造 9 维双爪相对特征。
+- S2-pair：前 14 维观测及动作解码与 S2 一致，仅追加共享系计算出的 9 维双爪
+  相对位姿 AUX。右臂动作已在其自身 base 系，不再做共享系到右 base 的逆映射。
+- S4：先按同一个 H 把两臂共享系观测映射到 G；body action 解码后经 H⁻¹ 回共享系，
+  再映射到各臂自身 base。每个 rollout 内 H 固定，具体参数见下一节。
 - EEF 目标调用 `move_p`，使用固件 IK。SDK 高层输入是**米、弧度**，
   `move_gripper_m` 是米和牛顿；不再乘 CAN 单位倍率。`se3.mat_to_rpy`
   每次都对旋转矩阵重新分解，返回的欧拉角本身就是 canonical 范围，
@@ -145,6 +150,103 @@ uv run --no-sync python script/piper_rollout.py --server http://CLOUD_IP:7891 --
   略微超出夹爪物理行程不会损坏硬件，裁剪即可。关节限位交给 SDK/固件
   （`set_joint_limits_enabled(True)`），不在客户端重复实现会拒绝整条前缀
   的步长检查。
+
+## S2-pair 部署：保留各臂 base 观测，追加双手几何
+
+云端使用 `piper_fold_s2_pair`，本地使用 `--rung s2_pair`。服务输入 23 维 state、
+输出 20 维已反归一化的 body 相对动作。它与 S3 的维度相同，但前 14 维坐标系不同，
+协议按 rung 严格区分；S2 的 14 维 state 也不能直接发送给此服务。
+
+```bash
+# 云端：使用训练保存的 S2-pair checkpoint 和其中的 norm_stats.json
+PATH="$PWD/.venv/bin:$PATH" bash script/dm05_launcher.sh \
+  --exp playground/dm05_piper.py --task inference \
+  --data-config.dataset-name piper_fold_s2_pair --data-config.relative-mode se3 \
+  --model-config.model-name-or-path /kpfs_ssd/data/wzy/data/user_checkpoints/piper_s2_pair/checkpoint-15000 \
+  --inference-config.port 7891
+
+# 本地机械臂机器：先只采集、推理和解码
+uv run --no-sync python script/piper_rollout.py \
+  --server http://CLOUD_IP:7891 --rung s2_pair --dry-run
+
+# 复用现有 SDK/CAN 的 EEF 执行路径
+uv run --no-sync python script/piper_rollout.py \
+  --server http://CLOUD_IP:7891 --rung s2_pair --execute --speed 10
+```
+
+每臂原始观测从真实关节 FK 构造，仍为自身 base 系的 `[xyz, rotvec, gripper]`。
+尾部 AUX 为 `T_L⁻¹ T_RIGHT_BASE_TO_LEFT_BASE T_R` 的 xyz 与旋转矩阵前两行（9 维），
+与训练 `eef_local_pair` 转换一致。AUX 仅参与 state 条件输入，不加入动作，也不
+参与目标解码；两臂目标按各自 `T_anchor @ ΔT` 还原后直接交给固件 IK。
+该组无需 S4 的 episode-frame 参数或 S5 的虚拟 base 文件。
+
+服务端按数据集保留 EEF/AUX 描述，并在调用模型前拒绝维度不符或含 NaN/Inf 的
+state。checkpoint 中的统计必须对应 23 维 state 和 20 维 action。
+
+2026-09-14 已用上面 `checkpoint-15000` 在单张 A800 80GB 上完成真实模型冒烟测试：
+选择留出 episode 36 / 638 / 1240 的第 100 / 300 / 600 帧，从对应真实关节重建
+23 维观测并读取三路视频图像，经 Flask `/v1/infer` 处理函数执行完整预处理、模型推理、
+反归一化和部署解码。三次均返回 HTTP 200、`(50,20)` 动作及有限的 `(50,14)` 执行目标；
+部署与离线解码的位姿矩阵最大差 `<3e-15`。
+
+真实测试还修复了默认后端 suffix CUDA Graph 的时间条件参数不匹配，以及动作投影和
+累积状态与 eager 分支精度不一致的问题。修复后捕获 2 个 profile、0 次回退；同一
+输入及 seed 的回放与 eager 动作最大绝对差约 `0.00195`（混合单位的 action 分量，
+不是米制误差）。该次回放/普通推理耗时约 0.805 / 0.952 秒，仅为本次环境下的观测值。
+
+本地测试产物保存在 `results/piper_s2_pair_smoke/`：`report.json`、逐样本动作/命令、
+运行日志和可复现的 `run.py`。在同一工作区可用下列命令重新运行：
+
+```bash
+NO_ALBUMENTATIONS_UPDATE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  .venv/bin/python results/piper_s2_pair_smoke/run.py
+```
+
+这些是部署链路与数值一致性测试，只有 3 个留出观测，不构成完整任务评测；未下发真机指令。
+另有 109 项 Piper 相关回归和 4 项 graph/eager 精度回归通过。
+
+## S4 部署：每个 rollout 固定一个坐标系
+
+云端加载 S4 checkpoint 及其独立归一化统计；服务自动采用 14 维轴角 state 和
+20 维 body-frame action，并拒绝其他 rung 的客户端：
+
+```bash
+script/dm05_launcher.sh --exp playground/dm05_piper.py --task inference \
+  --data-config.dataset-name piper_fold_s4 --data-config.relative-mode se3 \
+  --model-config.model-name-or-path user_checkpoints/piper_s4/checkpoint-60000 \
+  --inference-config.port 7891
+
+# 在机械臂机器上先验证一次观测、推理和解码
+uv run --no-sync python script/piper_rollout.py \
+  --server http://CLOUD_IP:7891 --rung s4 \
+  --s4-episode-id cloth-001 --s4-seed 0 --s4-xy-range 0.5 --dry-run
+
+# 使用相同参数复现同一个 H，按已有 SDK 路径执行
+uv run --no-sync python script/piper_rollout.py \
+  --server http://CLOUD_IP:7891 --rung s4 \
+  --s4-episode-id cloth-001 --s4-seed 0 --s4-xy-range 0.5 --execute --speed 10
+```
+
+`--s4-episode-id` 不传时，每次进程启动生成新的 UUID；它与 `--s4-seed`（默认 0）
+共同确定 H。采样复用训练的 `sample_episode_frame`：`C=I`、+z 向上、
+`yaw~U[-π,π)`、x/y 各 `U[-range,range]`、z 平移为 0。`--s4-xy-range`
+默认 0.5 m，若训练改过该范围，部署也应传入对应值。启动日志的 `s4` JSON
+记录 episode ID、seed、范围和完整 W→G 矩阵；保存日志即可复现。
+
+一个进程对应一个 rollout episode，H 在打开硬件前确定，所有观测、HTTP 重试及
+chunk 均复用该 H。开始新 episode 时重新启动进程并使用新的 ID；旋转解缠历史
+也随新的 `Representation` 重置。需要复现训练某条 episode 的 H 时，ID 使用
+`episode_frames.json` 中的完整键（例如 `episode_000123.jsonl`），seed 和范围
+使用该数据的 `manifest.json` 配置。
+
+观测换系为 `T_L^G = H FK(q_L)`、`T_R^G = H T_RIGHT_BASE_TO_LEFT_BASE FK(q_R)`。
+模型只接收 G 中的 state；每个 chunk 都以发出请求时的原始 state 为锚点，
+按 `T_target^G = T_anchor^G ΔT` 解码，再左乘 H⁻¹ 回 W，右臂最后乘自身 base
+外参的逆。夹爪始终保留绝对宽度。H 由客户端管理，云端无需加载
+`episode_frames.json`，也不需要为不同 H 重启服务。
+
+协议、训练编码到执行位姿的换系、跨请求轴角解缠和模拟 HTTP dry-run 已有测试；
+尚未验证 S4 checkpoint 的实际任务成功率或真实 CAN/相机/固件执行。
 
 ## RTC（Real-Time Chunking，仅部署侧）
 
@@ -336,7 +438,7 @@ export ROS_MASTER_URI=http://机械臂机器IP:11311   # 或用 --ros-master-uri
 
 - `--rtc-mode sync` 是本次新增的"不开 RTC"选项：完全对应用户要的
   "执行完所有动作后，等待推理结果再继续执行"，没有拼接/淡化，也没有后台线程。
-- 没有单元测试（硬件在环脚本），验证方式是 `--dry-run`（一次同步推理，任何异常
+- 以下为 ROS 客户端恢复后的验证方案；当前空脚本尚不能执行。验证方式是 `--dry-run`（一次同步推理，任何异常
   直接抛出退出）→ `--rtc-mode chunked` 不带 `--execute` 跑一段观察 `remain`/
   `latency_ms` 日志是否健康（`remain` 不应长期贴近 0）→ 有人看护、可用实体急停
   的条件下加 `--max-steps` 限制、带 `--execute` 短测。
@@ -361,4 +463,5 @@ uv run --no-sync python -m pytest tests/test_piper_deploy.py tests/test_piper_re
 ```
 
 测试环境需安装 pytest；其中服务协议测试还需要云端训练依赖。
-仅有本地最小依赖时可加 `-k "not server_contract"` 跳过服务端测试。
+仅有本地最小依赖时可加 `-k "not server_contract and not matches_training"`，
+跳过需要训练环境的服务配置与训练编码器测试。

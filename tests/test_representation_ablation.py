@@ -378,3 +378,62 @@ def test_s2_pair_can_be_added_without_rewriting_existing_rungs(tmp_path):
             assert b["state"] == a["state"] + c["state"][14:]
             assert b["images_1"] == a["images_1"] and b["prompt"] == a["prompt"]
             assert "action" not in b
+
+
+@pytest.mark.parametrize("image_augmentation", [True, False])
+def test_robotwin_reference_images_preserve_s2_pair_actions(tmp_path, image_augmentation):
+    from types import SimpleNamespace
+
+    from opendm.data.augmentations import (
+        NoAugmentationPipeline,
+        TrainingTransformPipeline,
+    )
+    from opendm.data.transforms import PixelTransform
+    from playground.dm05_robotwin2_ablation import DM05DataConfig
+
+    config = DM05DataConfig(
+        dataset_name="robotwin2_ablation_s2_pair",
+        relative_mode="se3",
+        jsonl_dir=str(tmp_path),
+        norm_stats_root=str(tmp_path),
+        image_augmentation=image_augmentation,
+    )
+    config.norm_stats_path(50).write_text(
+        json.dumps({
+            "norm_stats": {
+                key: {
+                    "mean": [0] * dim,
+                    "std": [1] * dim,
+                    "q01": [-2] * dim,
+                    "q99": [2] * dim,
+                }
+                for key, dim in [("state", 23), ("action", 20)]
+            }
+        })
+    )
+    states = np.zeros((2, 23))
+    states[1, 0] = 0.1
+    states[1, 14:] = 1000  # Future AUX must never enter action supervision.
+    (tmp_path / "episode.jsonl").write_text(
+        "".join(json.dumps({"state": s.tolist()}) + "\n" for s in states)
+    )
+    tokenizer = SimpleNamespace(pad_token_id=0, convert_tokens_to_ids=lambda token: 1)
+    dataset, _ = config.build_dataset(SimpleNamespace(tokenizer=tokenizer), 50)
+    pipeline = dataset.transforms
+    pixels = next(t for t in pipeline.transforms if isinstance(t, PixelTransform))
+    expected_type = (
+        TrainingTransformPipeline if image_augmentation else NoAugmentationPipeline
+    )
+    assert isinstance(pixels.transform_pipeline, expected_type)
+    if not image_augmentation:
+        frame = np.random.default_rng(3).integers(0, 256, (51, 77, 3), dtype=np.uint8)
+        actual = pixels._transform_images([frame])[0]
+        expected = NoAugmentationPipeline()(image=frame)["image"]
+        np.testing.assert_array_equal(np.asarray(actual), expected)
+
+    dataset.transforms = None
+    encoded = pipeline.transforms[0](dataset[0])
+    assert encoded["state"].shape == (23,)
+    assert encoded["action"].shape == (1, 50, 20)
+    np.testing.assert_allclose(encoded["action"][0, :, 0], 0.1)
+    assert np.abs(encoded["action"]).max() <= 1

@@ -68,7 +68,7 @@
 | **S2-pair** | 是 / 23 | S2 state + 当前 `T_L⁻¹T_R` 的 xyz + rot6d（9 维 AUX） | 同 S2 / 20 | 当前末端局部系 | 对 S2：只增加双手几何；对 S3：原 14 维 state 仍在各臂 base 系 |
 | **S3a** | 是 / 14 | 每臂 `[p_t,r_t,g_t]`，统一到 `W` | 同 S2 / 20 | 各臂当前末端局部系 | 对 S2：只统一 state 的参考系 |
 | **S3** | 是 / 23 | S3a 的 state + `T_L⁻¹T_R` 的 `[xyz,rot6d]`（9 维） | 同 S2 / 20 | 各臂当前末端局部系 | 对 S3a：只增加双末端相对位姿观测 |
-| **S4（训练管线已实现）** | 是 / 14 | 每臂 `[p_t,r_t,g_t]`，统一到 `G_e`；z 轴重力对齐，水平原点及 yaw 每 episode 随机 | 同 S2 / 20 | 各臂当前末端局部系 | 对 S3a：只移除跨 episode 固定的水平坐标参考；详见 §5 |
+| **S4（训练与部署代码已实现）** | 是 / 14 | 每臂 `[p_t,r_t,g_t]`，统一到 `G_e`；z 轴重力对齐，水平原点及 yaw 每 episode 随机 | 同 S2 / 20 | 各臂当前末端局部系 | 对 S3a：只移除跨 episode 固定的水平坐标参考；详见 §5 |
 | **S5** | 是 / 14 | 每臂 `[q̂_t,g_t]`，由虚拟 base 下的 IK 重建 | 每臂 `[q̂_{t+k}−q̂_t,g_{t+k}]` / 14 | 虚拟机械臂的关节空间 | 对 S0：真实关节轨迹改为虚拟 base + IK 重建轨迹 |
 
 这里的对照顺序为 `S0 → S1 → S2 → S3a`，随后由 S3a 分出 S3 和 S4；S5 与 S0 比较。S1→S2 测的是整套动作编码选择，不能单独归因为 body-frame 的收益，因为旋转编码和输出维度也改变了。
@@ -214,7 +214,19 @@ PATH="$PWD/.venv/bin:$PATH" bash script/dm05_launcher.sh \
   --trainer-config.output-dir user_checkpoints/piper_ablation/s2_pair
 ```
 
-转换复用原 `split.json`。原始 local state、视频和 prompt 保持一致；新注册独立统计 23 维 state，不得复用 S2 统计。离线评测已支持 `--dataset-name piper_fold_s2_pair`，按各臂自身 base 解码，AUX 不参与目标。当前 Piper 真机服务协议尚未加入此组；这里只实现训练和离线解码，不将 23 维 state 直接发送给原 S2 客户端。
+转换复用原 `split.json`。原始 local state、视频和 prompt 保持一致；新注册独立统计
+23 维 state，不得复用 S2 统计。离线评测已支持 `--dataset-name piper_fold_s2_pair`，
+按各臂自身 base 解码，AUX 不参与目标。
+
+**S2-pair 推理侧已接入**：云端使用 `piper_fold_s2_pair` / `relative-mode se3`，
+SDK 客户端使用 `--rung s2_pair`。前 14 维 state 保持 S2 的各臂自身 base 定义，
+只在构造末尾 9 维双手相对特征时使用 Piper 安装外参。服务返回 20 维 body 相对动作，
+客户端按各臂原始锚点直接解码到其自身 base，不执行 S3 的右臂共享系逆映射。
+服务协议区分 S2、S2-pair 和 S3，不能因 action/state 宽度相同而混用。
+具体 checkpoint 启动与本地命令见 [S2-pair 部署](piper_deployment.md#s2-pair-部署保留各臂-base-观测追加双手几何)。
+2026-09-14 已用 `/kpfs_ssd/data/wzy/data/user_checkpoints/piper_s2_pair/checkpoint-15000`
+在 A800 上测试 3 个留出观测：真实模型服务处理函数均返回 `(50,20)` 动作，
+客户端成功解码为 `(50,14)` 各臂 base 执行目标；尚未开展真机任务验证。
 
 对照为 `S2 / S2-pair / S3a / S3` 的 2×2 组合（是否共享原 state 参考系 × 是否追加双手几何），见 RoboTwin 文档的 S2-pair 说明。
 
@@ -237,7 +249,7 @@ S2/S3a/S3/S4 预测 body-frame SE(3) 变换（米 + 6D 旋转）。**原始 loss
 `tests/test_piper_common_space.py` 里有一条关键测试：把同一条轨迹分别按 S0 和 S2 编码再解码，
 要求得到**相同的位姿**。如果这条不过，任何 S0/S2 差异都只是解码噪声。
 
-## 5. S4：重力对齐、水平坐标随机（训练实验）
+## 5. S4：重力对齐、水平坐标随机（训练与部署）
 
 ![S4：同一物理轨迹在三个 episode 参考系中的不同表达](assets/piper_representation/s4_episodes.gif)
 
@@ -304,7 +316,18 @@ PATH="$PWD/.venv/bin:$PATH" bash script/dm05_launcher.sh \
 
 `decode_to_common_space(..., episode_frame=H_e)` 先解码到 G，再经 `H_e⁻¹` 回 W，最后将右臂换回自身 base。缺少 S4 变换时明确报错。不要单独复制 JSONL 而丢掉 `episode_frames.json`。
 
-**S4 真机 rollout 尚未接入**：现有 Piper 服务协议会拒绝 S4。部署前还需在 rollout 起始时选定固定 H，变换每次真实观测，并对预测执行同一个逆映射。本次完善到数据准备、训练、离线解码，不把数学逆映射等同于已完成硬件联调。
+**S4 部署代码已接入**：云端使用 `piper_fold_s4` / `relative-mode se3`，
+SDK 客户端使用 `script/piper_rollout.py --rung s4`。启动时通过训练共用的采样器
+选定一个固定 H，每次观测先从各臂 base 变到 W，再共同左乘 H。
+预测以请求时的观测为锚点解码到 G，经 H⁻¹ 回 W，最后把右臂还原到自身 base。
+服务返回 20 维已反归一化的 body 相对动作，换系全在客户端完成。
+
+`--s4-episode-id`、`--s4-seed`（默认 0）、`--s4-xy-range`（默认 0.5 m）控制 H；
+不指定 ID 时每次进程启动生成新 UUID。启动日志保存这些参数和完整 H，整个
+rollout（含 HTTP 重试和新 chunk）保持不变。新 episode 须新建客户端进程，
+以重置 H 与轴角解缠历史。当前仅接受保持 +z 向上且 z 平移为零的 H。
+完整云端、dry-run 与执行命令见 [S4 部署](piper_deployment.md#s4-部署每个-rollout-固定一个坐标系)。
+代码已完成模拟验证，尚未开展 S4 真机联调或 checkpoint 成功率测试。
 
 ### 与 HiFi-UMI-2K 对齐到哪一层
 
@@ -430,7 +453,9 @@ python script/piper_compute_norm_stats.py --rung s5
 | `opendm/data/transforms.py` | 新增 `ActionRelativeSE3` / `ActionAbsoluteSE3`；`BuildAction` 新增 `relative_mode` |
 | `opendm/dataset/piper_dual.py` | 8 个阶梯的数据集注册（含 S2-pair/S3a/S4） |
 | `opendm/eval/piper_common_space.py` | 跨表征统一空间解码器 + 指标 |
-| `playground/dm05_piper.py` | 训练/服务入口，单文件参数化 |
+| `playground/dm05_piper.py` | 训练/服务入口，单文件参数化，含 S4 14→20 维协议 |
+| `opendm/deploy/piper.py` | 部署表征适配；S2-pair 本地 EEF+AUX、S4 固定 H 换系 |
+| `script/piper_rollout.py` | SDK/CAN/RealSense 客户端；S4 episode 参数、复现日志与 rollout |
 | `script/piper_lerobot_to_jsonl.py` | LeRobot → OpenDM JSONL，含 4 种表征 |
 | `script/piper_prepare_s4.py` | S3a → 每 episode 固定水平换系的 S4，保存变换及源哈希 |
 | `opendm/data/episode_frame.py` | RoboTwin/Piper 共用 S4 变换与逆映射 |
@@ -467,10 +492,10 @@ python script/piper_compute_norm_stats.py --rung s5
 - **S0（关节）**：直接下发真实关节角。**S5** 的关节属于估计虚拟 base，部署必须使用训练时的
   `estimated_bases.json` 映射观测和目标，不能直接下发。`pyAgxArm` CAN 层单位 **0.001 度**，
   但高层 `move_j` 接收弧度，客户端不要重复换算。
-- **S1 / S2 / S3（EEF）**：下发末端位姿，用**固件 IK**（`arm_end_pose_ctrl`，X/Y/Z 单位 0.001 mm、
+- **S1 / S2 / S2-pair / S3 / S3a / S4（EEF）**：下发末端位姿，用**固件 IK**（`arm_end_pose_ctrl`，X/Y/Z 单位 0.001 mm、
   RX/RY/RZ 单位 0.001 度），避免自研 IK 与固件约定不一致。
 - `qpos_ee` 是 **flange** 位姿、TCP offset = 0，客户端不要重复加夹爪偏移。
-- **S3 部署时右臂必须把统一系位姿经 `T_RIGHT_BASE_TO_LEFT_BASE⁻¹` 映射回自己的 base 系。**
+- **S3/S3a 部署时右臂必须把统一系位姿经 `T_RIGHT_BASE_TO_LEFT_BASE⁻¹` 映射回自己的 base 系。S4 先对两臂左乘 H⁻¹，再执行相同的右臂映射。**
 - 复用 `third_party/robochallenge_inference/policies/opendm_policy.py` 里的成熟技巧：
   `_align_eef_quat_signs` 四元数符号连续性、`unwrap_euler_sequence` 欧拉解缠、夹爪单位换算。
   这些在 EEF 级 rollout 上是必需项，不是可选优化。
@@ -493,7 +518,7 @@ python script/piper_compute_norm_stats.py --rung s5
 
 ## 10. 当前状态与下一步
 
-以下原有运行数字沿用此前实验记录。2026-09-12 新增 S4 转换、注册、统计入口和离线逆映射，并执行针对性测试；未开展 Piper S4 全量训练或硬件测试。
+以下原有运行数字沿用此前实验记录。2026-09-12 新增 S4 转换、注册、统计入口和离线逆映射；2026-09-14 补齐 S4 服务协议、SDK 客户端换系及复现参数，并增加部署测试。未开展 Piper S4 全量训练或硬件测试。
 
 ### 已就绪（原有实验记录及新增入口）
 
@@ -505,6 +530,8 @@ python script/piper_compute_norm_stats.py --rung s5
 | 离线统一空间评测 | ✅ 在 S0 / S3 checkpoint 上出过表 |
 | 单元测试 | ✅ 73 条全绿（`pytest tests/ -q`） |
 | S4 转换、训练注册与离线逆映射代码 | ✅ 按 §5 执行，尚未全量运行 |
+| S2-pair 云端协议与 SDK rollout 代码 | ✅ 23 维各臂 base EEF+AUX、20 维 body action；checkpoint-15000 已通过 3 个真实模型推理样本 |
+| S4 云端协议与 SDK rollout 代码 | ✅ 固定 H、观测/预测双向映射及复现日志；模拟验证已覆盖，待真机联调 |
 | S5 的虚拟 base 估计 | ✅ `data/piper_fold_cloth/estimated_bases.json` |
 
 ### 未就绪
@@ -512,10 +539,10 @@ python script/piper_compute_norm_stats.py --rung s5
 | 项 | 状态 | 说明 |
 |---|---|---|
 | S4 全量数据生成、统计与训练 | ⏳ | 脚本和注册已实现，按 §5 执行；尚无完整训练结果 |
-| S4 真机 rollout | ❌ | 离线逆映射已实现，真机协议及客户端尚未接入 |
+| S4 真机联调与任务评测 | ⏳ | 服务及 SDK 客户端代码已接入，尚未在硬件上验证 |
 | S5 的 JSONL 数据 | ⏸ 转换到 27/1255 时按要求停止 | 脚本支持断点续跑，重跑即可接上 |
 | S5 的归一化统计 | ❌ | 依赖上一项 |
-| 真机 rollout 客户端 | ❌ | 需求见 §8；无硬件无法验证，且要等模型训完 |
+| 真机 rollout 硬件验证 | ⏳ | SDK 客户端已实现；实际 CAN、相机和模型效果仍需验证 |
 | `docs/en/` 英文镜像 | ❌ | 只写了中文版 |
 
 ### 下一步（建议顺序）
@@ -547,7 +574,7 @@ python script/piper_compute_norm_stats.py --rung s5
 **3. 按 S1 → S2 → S3a → S3 → S4 → S5 训练；S4 先按 §5 准备数据，并与 S3a 比较**，超参与 S0 完全一致，只改
 `--data-config.dataset-name`（S2/S3/S3a/S4 另加 `--data-config.relative-mode se3`）。
 
-**4. 离线统一空间评测出总表**，再挑 2-3 个代表上真机（真机客户端需按 §8 实现）。
+**4. 离线统一空间评测出总表**，再挑 2-3 个代表上真机（使用 §8 链接的 SDK 客户端，先 dry-run 再验证执行）。
 
 ### 汇报时请保留的两条边界
 

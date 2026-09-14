@@ -21,10 +21,25 @@ End-effector, UMI body-frame delta with 6D rotation (S2)::
         --data-config.dataset-name piper_fold_s2 \\
         --data-config.relative-mode se3
 
+Local-frame state plus inter-gripper pose (S2-pair), also supported for serving::
+
+        --data-config.dataset-name piper_fold_s2_pair \\
+        --data-config.relative-mode se3
+
+This rung uses 23-D state (14 local EEF + 9 AUX) and 20-D body actions.
+
 Unified frame plus inter-gripper pose (S3)::
 
         --data-config.dataset-name piper_fold_s3 \\
         --data-config.relative-mode se3
+
+Gravity-aligned episode frame (S4), also supported for serving::
+
+        --data-config.dataset-name piper_fold_s4 \\
+        --data-config.relative-mode se3
+
+The S4 robot client fixes W-to-G at rollout startup and handles both coordinate
+conversions. This endpoint receives 14-D state in G and returns 20-D body actions.
 
 Serving mirrors the training representation; see ``--inference-config`` defaults
 and :meth:`DM05InferenceConfig._request_default_overrides`.
@@ -176,6 +191,23 @@ class DM05InferenceConfig(_DM05InferenceConfig):
         payload = response.get_json()
         payload["metadata"]["piper"] = spec
         return jsonify(payload)
+
+    def _resolve_state_desc(self, robot_type):
+        from opendm.constants.robot import RobotType
+
+        if robot_type not in (None, RobotType.PIPER_DUAL.value):
+            raise ValueError("Piper inference requires robot_type='Piper Dual'")
+        # The generic registry describes Piper's 14 joint dimensions. Serving
+        # an ablation must instead keep its EEF/AUX descriptor from the dataset.
+        return list(RUNG_STATE_DESCS[self.dataset_name])
+
+    def _prepare_input(self, body):
+        from opendm.deploy.piper import contract, finite_array
+
+        data = super()._prepare_input(body)
+        spec = contract(self.dataset_name.removeprefix("piper_fold_"))
+        finite_array(data["state"], (spec["state_dim"],))
+        return data
 
     def _request_default_overrides(self) -> dict:
         from opendm.constants.robot import RobotType

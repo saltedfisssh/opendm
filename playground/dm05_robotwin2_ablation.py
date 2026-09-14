@@ -13,6 +13,7 @@ from opendm.exp.dm05_exp import (
     DM05OptimizerConfig as BaseOptimizerConfig,
     DM05TrainerConfig as BaseTrainerConfig,
 )
+from playground.dm05_robotwin2 import DM05DataConfig as RobotwinDataConfig
 
 
 @dataclass
@@ -36,6 +37,21 @@ class DM05TrainerConfig(BaseTrainerConfig):
 class DM05DataConfig(BaseDataConfig):
     dataset_name: str = "robotwin2_ablation_s0"
     norm_stats_root: str = f"{DATA_ROOT}/norm_stats"
+    image_augmentation: bool = True
+
+    def build_dataset(
+        self,
+        processor,
+        action_horizon: int,
+        tokenizer_max_length: int = 1024,
+    ) -> tuple:
+        if not self.image_augmentation:
+            # Reuse the reference image pipeline while retaining this instance's
+            # ablation metadata, relative action transform and norm statistics.
+            return RobotwinDataConfig.build_dataset(
+                self, processor, action_horizon, tokenizer_max_length
+            )
+        return super().build_dataset(processor, action_horizon, tokenizer_max_length)
 
     def _dataset_info(self):
         rung = self.dataset_name.removeprefix("robotwin2_ablation_")
